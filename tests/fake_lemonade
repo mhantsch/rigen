@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Fake `lemonade` CLI for rigen tests: prints a canned `lemonade list` table.
+
+Supports only the `list` subcommand. The Local section mirrors the live format:
+40-char name column padded by *display* width (U+2011 counts as 2, like the real
+lemonade), Downloaded, Size (GB), Details (recipe).
+"""
+
+import sys
+
+DASHES_W2 = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+
+
+def disp_width(s: str) -> int:
+    return sum(2 if ch in DASHES_W2 else 1 for ch in s)
+
+
+def pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - disp_width(s))
+
+LOCAL_ROWS = [
+    ("SD-1.5", "7.17", "sd-cpp"),
+    ("SD-Turbo", "4.86", "sd-cpp"),
+    ("AmazingRender\u2011XL\u2011v14", "6.46", "sd-cpp"),  # U+2011 non-breaking hyphen
+    ("Qwen-Image-2.1-Turbo", "12.70", "sd-cpp"),
+    ("Flint-GGUF", "23.30", "llamacpp"),
+    ("Gemma-4-12B-it-GGUF", "6.80", "llamacpp"),
+]
+
+REMOTE_ROWS = [
+    ("Anima-Turbo", "5.25", "thenoise"),
+    ("Krea-2-Turbo", "35.00", "thenoise"),
+]
+
+HEADER = f"{pad('Model Name', 40)}{pad('Downloaded', 10)}{'Size (GB)':>10}      Details"
+DASHES = "-" * 88
+
+
+def print_section(title: str, rows, downloaded: str) -> None:
+    print(title)
+    print(HEADER)
+    print(DASHES)
+    for name, size, recipe in rows:
+        print(f"{pad(name, 40)}{pad(downloaded, 10)}{size:>10}       {recipe}")
+    print(DASHES)
+
+
+def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "list":
+        print_section("Local", LOCAL_ROWS, "Yes")
+        print()
+        print_section("Available for Download", REMOTE_ROWS, "No")
+        return 0
+    sys.stderr.write("fake_lemonade: only the 'list' subcommand is supported\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

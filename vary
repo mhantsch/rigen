@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""vary — expand {a|b|c} alternation groups in a prompt spec.
+
+Reads a prompt "spec" (as arguments, or one spec per line on stdin), finds
+brace pairs, splits each brace section on '|', and prints one prompt per
+combination (multiple groups produce their cartesian product). With -r, one
+option is picked randomly per group instead (repeated -n times).
+
+  vary "a {tall|short|slender} man"
+      -> a tall man
+         a short man
+         a slender man
+
+  vary -r -n 3 "pick {one|two|three} of a {car|house}"
+      -> 3 prompts with random choices
+
+Intended to pipe varied prompts into other tools, e.g.:
+  vary "{red|blue} {car|truck}" | rigen -m SD-1.5 -n 1 --out ./out
+
+Unmatched braces are kept literally; parts are trimmed; blank stdin lines
+are skipped. Stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import random
+import sys
+
+VERSION = "1.0.0"
+PROG = "vary"
+
+
+def _template(spec: str):
+    """Split a spec into (template, groups); groups = option lists, in order."""
+    template = []  # ("lit", text) / ("ph", [options])
+    groups = []
+    pos = 0
+    while True:
+        s = spec.find("{", pos)
+        if s == -1:
+            break
+        e = spec.find("}", s + 1)
+        if e == -1:
+            break  # unmatched '{' -> literal
+        options = [opt.strip() for opt in spec[s + 1:e].split("|")]
+        template.append(("lit", spec[pos:s]))
+        template.append(("ph", options))
+        groups.append(options)
+        pos = e + 1
+    template.append(("lit", spec[pos:]))
+    return template, groups
+
+
+def _render(template, choices) -> str:
+    it = iter(choices)
+    return "".join(next(it) if kind == "ph" else text for kind, text in template)
+
+
+def vary_spec(spec: str) -> list:
+    """Expand one spec into its cartesian product (>= 1 element)."""
+    template, groups = _template(spec)
+    if not groups:
+        return [spec]
+    return [_render(template, combo) for combo in itertools.product(*groups)]
+
+
+def vary_random(spec: str, n: int) -> list:
+    """Expand one spec into n random combinations (>= 1 element)."""
+    template, groups = _template(spec)
+    if not groups:
+        return [spec]
+    return [_render(template, [random.choice(g) for g in groups]) for _ in range(n)]
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog=PROG,
+        description="Expand {a|b|c} groups in a prompt spec into multiple prompts "
+                    "(one per line). Multiple groups produce the cartesian product; "
+                    "-r picks random options instead.",
+        epilog="Without arguments, specs are read from stdin, one per line "
+               "(e.g. vary < specs.txt | rigen -m SD-1.5).",
+    )
+    ap.add_argument("--version", action="version", version=f"{PROG} {VERSION}")
+    ap.add_argument("-r", "--random", action="store_true",
+                    help="pick one random option from each brace group "
+                         "(instead of the cartesian product)")
+    ap.add_argument("-n", "--count", type=int, default=1, metavar="N",
+                    help="with -r: number of random prompts to generate (>= 1)")
+    ap.add_argument("spec", nargs="*",
+                    help="prompt spec; if omitted, read specs from stdin (one per line)")
+    args = ap.parse_args(argv)
+
+    if args.count < 1:
+        sys.stderr.write(f"{PROG}: -n must be >= 1 (got {args.count})\n")
+        return 2
+    if not args.random and args.count != 1:
+        sys.stderr.write(f"{PROG}: -n is only valid together with -r\n")
+        return 2
+
+    try:
+        if args.spec:
+            specs = [" ".join(args.spec)]
+        elif sys.stdin.isatty():
+            ap.print_usage(sys.stderr)
+            sys.stderr.write(f"{PROG}: no spec given (pass one as arguments "
+                             "or pipe specs via stdin)\n")
+            return 2
+        else:
+            data = sys.stdin.buffer.read().decode("utf-8")
+            specs = [line.strip() for line in data.split("\n")]
+            specs = [s for s in specs if s]
+            if not specs:
+                sys.stderr.write(f"{PROG}: no specs read from stdin\n")
+                return 2
+    except UnicodeDecodeError:
+        sys.stderr.write(f"{PROG}: stdin is not valid UTF-8\n")
+        return 2
+
+    for spec in specs:
+        if args.random:
+            for prompt in vary_random(spec, args.count):
+                sys.stdout.write(prompt + "\n")
+        else:
+            for prompt in vary_spec(spec):
+                sys.stdout.write(prompt + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

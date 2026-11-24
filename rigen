@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""rigen — Rapid Image GENeration.
+
+A thin, scriptable command-line client for the local Lemonade image-generation
+backend (lemond). Stdlib only. See RIGEN-SW-SPECIFICATION.md / RIGEN-SW-DESIGN.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import json
+import math
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "1.0.0"
+PROG = "rigen"
+
+# Exit codes (spec §8)
+EXIT_OK = 0
+EXIT_INTERNAL = 1
+EXIT_USAGE = 2
+EXIT_NO_WORK = 3
+EXIT_BACKEND_ERR = 4
+EXIT_UNREACHABLE = 5
+
+DEFAULT_BASE_URL = "http://127.0.0.1:13305"
+DEFAULT_FMT = "{model}_{prompt}_{batch_idx}.{ext}"
+DEFAULT_EXT = "png"
+GEN_ENDPOINT = "/api/v1/images/generations"
+MODELS_ENDPOINT = "/v1/models"
+TS_DEFAULT_FMT = "%Y%m%dT%H%M%SZ"
+
+# Unicode dashes mapped to ASCII '-' in filenames (design decision D2)
+UNICODE_DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+
+PLACEHOLDER_INTS = {"prompt", "model_idx", "prompt_idx", "batch_idx", "image_idx"}
+PLACEHOLDER_NAMES = {"model", "ext", "timestamp"} | PLACEHOLDER_INTS
+
+
+class UsageError(Exception):
+    """Validation / usage failure (exit 2). Message is printed verbatim to stderr."""
+
+
+class NoWorkError(Exception):
+    """Nothing to do (exit 3)."""
+
+
+class InternalError(Exception):
+    """Unexpected internal failure (exit 1)."""
+
+
+class BackendUnreachable(Exception):
+    """Connection-level failure (exit 5)."""
+
+
+class BackendError(Exception):
+    """Backend responded with an error (batch failure)."""
+
+
+def format_hms(seconds: float) -> str:
+    """Zero-padded HH:MM:SS (hours unbounded), rounded to the nearest second."""
+    s = max(0, round(seconds))
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def progress_label(done: int, total: int, eta: float | None = None) -> str:
+    """Progress token, e.g. `[2/5 (40%)]` or `[2/5 (40%) 00:03:12 remaining]`.
+
+    The ETA is omitted when it cannot yet be calculated (`eta is None`).
+    """
+    label = f"[{done}/{total} ({100 * done // total}%)"
+    if eta is not None:
+        label += f" {format_hms(eta)} remaining"
+    return label + "]"
+
+
+class Progress:
+    """Human progress on stderr (suppressed by --quiet; errors always print)."""
+
+    def __init__(self, quiet: bool, verbose: bool = False) -> None:
+        self.quiet = quiet
+        self.verbose = verbose
+
+    def say(self, msg: str) -> None:
+        if not self.quiet:
+            sys.stderr.write(f"{PROG}: {msg}\n")
+            sys.stderr.flush()
+
+    def say_wrapped(self, msg: str, width: int = 120, prefix: str = " > ") -> None:
+        # Intentionally NOT suppressed by --quiet: --quiet hides the progress lines,
+        # but --verbose prompt text stays visible (design decision D10).
+        if self.verbose:
+            for line in msg.splitlines():
+                # wrap each line to the given width, breaking at word boundaries if possible
+                while len(line) > width:
+                    # find the last whitespace before the width limit
+                    break_pos = line.rfind(" ", 0, width)
+                    if break_pos == -1:
+                        break_pos = width  # no whitespace found, hard break
+                    sys.stderr.write(f"{prefix}{line[:break_pos]}\n")
+                    line = line[break_pos:].lstrip()  # remove leading whitespace for next line
+                sys.stderr.write(f"{prefix}{line}\n")
+            sys.stderr.flush()
+
+    def err(self, msg: str) -> None:
+        sys.stderr.write(f"{PROG}: {msg}\n")
+        sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Generate raster images through the local Lemonade backend (lemond).",
+        epilog="Prompts: one --prompt, or newline-separated prompts via stdin "
+               "(e.g. cat prompts.txt | rigen -m SD-1.5).",
+    )
+    p.add_argument("--version", action="version", version=f"{PROG} {VERSION}")
+    p.add_argument("-p", "--prompt", metavar="TEXT",
+                   help="text prompt (stdin mode is used when omitted and stdin is piped)")
+    p.add_argument("--start", type=int, default=0, metavar="N",
+                   help="0-based index of the first prompt to process; earlier prompts "
+                        "are ignored (resume an interrupted run); indices and filenames "
+                        "keep their full-list positions (default: 0)")
+    p.add_argument("-m", "--model", action="append", dest="models", metavar="NAME",
+                   help="image-model display name (repeatable; required unless --list)")
+    p.add_argument("--fmt", default=DEFAULT_FMT, metavar="PATTERN",
+                   help=f"filename pattern, default {DEFAULT_FMT!r}; placeholders: "
+                        "{model} {prompt} {model_idx} {prompt_idx} {batch_idx} {image_idx} "
+                        "{timestamp[:STRFTIME]} {ext}; numeric indices accept {idx:04d}; "
+                        "if the pattern lacks {ext} and --ext is not '', '.{ext}' is appended")
+    p.add_argument("-n", "--count", type=int, default=1, metavar="N",
+                   help="images generated per model (>= 1, default 1)")
+    p.add_argument("-o", "--out", default=".", metavar="DIR",
+                   help="output directory (created if missing; default: current dir)")
+    p.add_argument("-s", "--size", metavar="WxH",
+                   help="image size as WIDTHxHEIGHT (default: model native size)")
+    p.add_argument("--steps", type=int, metavar="N", help="sampling steps (default: model default)")
+    p.add_argument("--cfg", type=float, metavar="F",
+                   help="classifier-free guidance scale, cfg_scale (default: model default)")
+    p.add_argument("--seed", type=int, metavar="N",
+                   help="RNG seed; negative requests a random seed (default: backend default)")
+    p.add_argument("--ext", default=DEFAULT_EXT, metavar="EXT",
+                   help="output file suffix (default: png; '' disables the suffix)")
+    p.add_argument("--base-url", default=DEFAULT_BASE_URL, metavar="URL",
+                   help=f"lemond base URL (default: {DEFAULT_BASE_URL})")
+    p.add_argument("--timeout", type=float, default=0.0, metavar="SECS",
+                   help="per-request HTTP timeout in seconds; 0 disables (default: 0)")
+    p.add_argument("--list", action="store_true", dest="list_models",
+                   help="list available image models (via lemonade list) and exit")
+    p.add_argument("--recipe", metavar="NAME",
+                   help="with --list: restrict to one recipe (e.g. sd-cpp, thenoise)")
+    p.add_argument("--lemonade-cmd", default="lemonade", metavar="CMD",
+                   help="lemonade binary used by --list (default: lemonade)")
+    p.add_argument("--json", action="store_true", dest="json_out",
+                   help="emit an NDJSON stream (per-image records + summary) on stdout")
+    p.add_argument("--quiet", action="store_true",
+                   help="suppress progress on stderr (errors are always shown)")
+    p.add_argument("--verbose", action="store_true",
+                   help="show each prompt while generating the corresponding images (default: only show prompt index)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print planned requests and exit without calling the backend")
+    return p
+
+
+def effective_fmt(args: argparse.Namespace) -> str:
+    """--fmt with the automatic '.{ext}' suffix applied (decision D6).
+
+    The suffix is appended unless the pattern already contains {ext}
+    (user manages the extension) or --ext was explicitly set to ''.
+    """
+    fmt = args.fmt
+    if args.ext and "{ext}" not in fmt:
+        fmt += ".{ext}"
+    return fmt
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """All pre-network validation; raises UsageError (exit 2)."""
+    if args.count < 1:
+        raise UsageError(f"--count must be >= 1 (got {args.count})")
+    if args.size is not None:
+        m = re.fullmatch(r"(\d+)x(\d+)", args.size)
+        if not m or int(m.group(1)) < 1 or int(m.group(2)) < 1:
+            raise UsageError(
+                f"--size must be WIDTHxHEIGHT with positive dimensions (got {args.size!r})")
+    if args.steps is not None and args.steps < 1:
+        raise UsageError(f"--steps must be >= 1 (got {args.steps})")
+    if args.cfg is not None and not math.isfinite(args.cfg):
+        raise UsageError("--cfg must be a finite number")
+    if args.ext != "" and not re.fullmatch(r"[A-Za-z0-9._-]+", args.ext):
+        raise UsageError(f"--ext must be a safe filename suffix (got {args.ext!r}); "
+                         "use --ext '' to disable the extension")
+    parse_fmt(effective_fmt(args))  # raises on bad placeholders / specs / '/'
+    if args.timeout < 0:
+        raise UsageError(f"--timeout must be >= 0 (got {args.timeout})")
+    if not args.base_url.strip():
+        raise UsageError("--base-url must not be empty")
+    if not args.models:
+        raise UsageError("at least one --model is required")
+    if args.start < 0:
+        raise UsageError(f"--start must be >= 0 (got {args.start})")
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+def collect_prompts(args: argparse.Namespace, stdin_is_tty: bool) -> list:
+    if args.prompt is not None:
+        prompt = args.prompt.strip()
+        if not prompt:
+            raise UsageError("--prompt must not be empty")
+        return [prompt]
+    if stdin_is_tty:
+        raise UsageError("No --prompt supplied and stdin is interactive; "
+                         "pipe prompts via stdin or pass --prompt.")
+    data = sys.stdin.buffer.read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise UsageError("stdin is not valid UTF-8")
+    prompts = []
+    for line in text.split("\n"):
+        line = line.strip("\r").strip()
+        if line:
+            prompts.append(line)
+    if not prompts:
+        raise NoWorkError("no prompts read from stdin (empty input)")
+    return prompts
+
+
+# ---------------------------------------------------------------------------
+# Filenames
+# ---------------------------------------------------------------------------
+
+def sanitize_component(value: str) -> str:
+    """Filesystem-safe: ASCII [A-Za-z0-9._-] kept, Unicode dashes -> '-', rest -> '_'."""
+    out = []
+    for ch in value:
+        if ch.isascii() and (ch.isalnum() or ch in "._-"):
+            out.append(ch)
+        elif ch in UNICODE_DASHES:
+            out.append("-")
+        else:
+            out.append("_")
+    return "".join(out)
+
+
+def parse_fmt(pattern: str) -> list:
+    """Validate a --fmt pattern; returns segments [("lit", text, None) | ("ph", name, spec)]."""
+    if not pattern:
+        raise UsageError("--fmt must not be empty")
+    segs = []
+    pos = 0
+    for m in re.finditer(r"\{([^{}]*)\}", pattern):
+        if m.start() > pos:
+            segs.append(("lit", pattern[pos:m.start()], None))
+        inner = m.group(1)
+        name, sep, spec = inner.partition(":")
+        if name not in PLACEHOLDER_NAMES:
+            raise UsageError(
+                f"--fmt: unknown placeholder '{{{inner}}}' (allowed: "
+                + ", ".join(sorted(PLACEHOLDER_NAMES)) + ")")
+        if sep:
+            if name == "timestamp":
+                try:
+                    sample = datetime(2026, 1, 1, tzinfo=timezone.utc).strftime(spec)
+                except (ValueError, TypeError) as e:
+                    raise UsageError(f"--fmt: invalid strftime format in '{{timestamp:{spec}}}'")
+                if "/" in sample:
+                    raise UsageError(f"--fmt: '{{timestamp:{spec}}}' would produce '/' in the filename")
+            elif name in PLACEHOLDER_INTS:
+                if not re.fullmatch(r"\d*d", spec):
+                    raise UsageError(
+                        f"--fmt: '{spec}' is not a valid integer format for "
+                        f"'{{{name}}}' (e.g. '04d')")
+            else:
+                raise UsageError(f"--fmt: '{{{name}}}' does not accept a format spec")
+        else:
+            spec = None
+        segs.append(("ph", name, spec))
+        pos = m.end()
+    if pos < len(pattern):
+        segs.append(("lit", pattern[pos:], None))
+    leftover = re.sub(r"\{[^{}]*\}", "", pattern)
+    if "{" in leftover or "}" in leftover:
+        raise UsageError("--fmt: unbalanced braces")
+    for kind, text, _ in segs:
+        if kind == "lit" and "/" in text:
+            raise UsageError("--fmt: literal '/' in filename is not allowed")
+    return segs
+
+
+def render_filename(segs: list, ctx: dict) -> str:
+    parts = []
+    for kind, name, spec in segs:
+        if kind == "lit":
+            parts.append(name)
+        elif name == "model":
+            parts.append(ctx["model"])
+        elif name in PLACEHOLDER_INTS:
+            parts.append(format(ctx[name], spec or "d"))
+        elif name == "timestamp":
+            parts.append(ctx["timestamp"](spec))
+        elif name == "ext":
+            parts.append(ctx["ext"])
+    filename = "".join(parts)
+    if not filename or filename in (".", ".."):
+        raise UsageError(f"--fmt produces an invalid filename: {filename!r}")
+    if "/" in filename:
+        raise UsageError(f"--fmt produces '/' in the filename: {filename!r}")
+    return filename
+
+
+# ---------------------------------------------------------------------------
+# lemonade list
+# ---------------------------------------------------------------------------
+
+def run_lemonade_list(cmd: str) -> str:
+    try:
+        proc = subprocess.run([cmd, "list"], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise UsageError(f"lemonade command not found: {cmd!r} (use --lemonade-cmd to set it)")
+    except OSError as e:
+        raise UsageError(f"cannot run lemonade command {cmd!r}: {e}")
+    if proc.returncode != 0:
+        tail = " | ".join((proc.stderr or proc.stdout or "").strip().splitlines()[-3:])
+        raise InternalError(f"'{cmd} list' failed (exit {proc.returncode})"
+                            + (f": {tail}" if tail else ""))
+    return proc.stdout
+
+
+def _is_dash_line(s: str) -> bool:
+    return len(s) >= 3 and set(s) <= {"-"}
+
+
+def parse_lemonade_list(text: str) -> list:
+    """Parse the 'Local' section of `lemonade list`; returns [{"name","recipe"}, ...].
+
+    Row fields: <name> <Yes|No> <size> <recipe>. The name column is padded by
+    *display* width (lemonade counts some unicode dashes as width 2), so fixed
+    character slicing is unreliable — fields are split on whitespace and the
+    Downloaded column is validated.
+    """
+    models = []
+    state = 0  # 0 = seeking 'Local', 1 = skipping header, 2 = in table
+    for line in text.splitlines():
+        stripped = line.strip()
+        if state == 0:
+            if stripped == "Local":
+                state = 1
+        elif state == 1:
+            if _is_dash_line(stripped):
+                state = 2
+        else:
+            if not stripped:
+                continue
+            if _is_dash_line(stripped):
+                break
+            fields = stripped.split()
+            if len(fields) < 3 or fields[1] not in ("Yes", "No"):
+                continue
+            models.append({"name": fields[0], "recipe": fields[-1]})
+    return models
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    models = parse_lemonade_list(run_lemonade_list(args.lemonade_cmd))
+    if args.recipe is not None:
+        models = [m for m in models if m["recipe"] == args.recipe]
+    if args.json_out:
+        sys.stdout.write(json.dumps({"models": models}, ensure_ascii=False) + "\n")
+    else:
+        for m in models:
+            sys.stdout.write(f"{m['name']}  ({m['recipe']})\n")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Backend HTTP
+# ---------------------------------------------------------------------------
+
+def apply_start(prompts: list, start: int) -> None:
+    """Validate --start against the collected list (design §5.1).
+
+    Indices keep their full-list positions (D8), so callers skip
+    prompt_idx < start in their loops instead of consuming a sliced copy.
+    """
+    if start >= len(prompts):
+        raise NoWorkError(f"no prompts at or after index {start} "
+                          f"({len(prompts)} prompt(s) read)")
+
+
+def check_connectivity(base_url: str, timeout: float) -> None:
+    """GET {base}/v1/models. Any HTTP response means reachable; raises BackendUnreachable."""
+    req = urllib.request.Request(base_url + MODELS_ENDPOINT, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or None) as resp:
+            resp.read(1)
+    except urllib.error.HTTPError:
+        return  # got an HTTP response: service is up
+    except (urllib.error.URLError, OSError) as e:
+        raise BackendUnreachable(str(e))
+
+
+def _extract_error_message(raw: bytes, fallback: str) -> str:
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+        err = doc.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if isinstance(msg, str) and msg:
+                return msg
+        if isinstance(err, str) and err:
+            return err
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        pass
+    text = raw.decode("utf-8", "replace").strip()
+    return f"{fallback}" + (f": {text[:200]}" if text else "")
+
+
+def post_generation(base_url: str, body: dict, timeout: float) -> list:
+    """POST a generation request; returns the 'data' list.
+
+    Raises BackendError on non-200 / bad payload, BackendUnreachable on connection failure.
+    """
+    url = base_url + GEN_ENDPOINT
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or None) as resp:
+            status = resp.status
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        raise BackendError(_extract_error_message(raw, f"HTTP {e.code} from backend"))
+    except (urllib.error.URLError, OSError) as e:
+        raise BackendUnreachable(str(e))
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise BackendError(f"backend returned non-JSON response (HTTP {status})")
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), list):
+        raise BackendError("backend response is missing the 'data' list")
+    return doc["data"]
+
+
+def make_request_body(args: argparse.Namespace, model: str, prompt: str) -> dict:
+    body = {"model": model, "prompt": prompt}
+    if args.size is not None:
+        body["size"] = args.size
+    body["n"] = args.count
+    body["response_format"] = "b64_json"
+    if args.steps is not None:
+        body["steps"] = args.steps
+    if args.cfg is not None:
+        body["cfg_scale"] = args.cfg
+    if args.seed is not None:
+        body["seed"] = args.seed
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+def _image_record(model, model_idx, prompt, prompt_idx, batch_idx, image_idx,
+                  file, status, error, generation_info) -> dict:
+    return {
+        "type": "image",
+        "model": model,
+        "model_idx": model_idx,
+        "prompt": prompt,
+        "prompt_idx": prompt_idx,
+        "batch_idx": batch_idx,
+        "image_idx": image_idx,
+        "file": file,
+        "status": status,
+        "error": error,
+        "generation_info": generation_info,
+    }
+
+
+def run_generation(args: argparse.Namespace, prompts: list, prog: Progress) -> int:
+    out_dir = Path(args.out).expanduser()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise InternalError(f"cannot create output directory {out_dir}: {e}")
+    out_dir = out_dir.resolve()
+
+    # D3: timestamp captured once at run start (UTC), shared by all files of this run.
+    ts_base = datetime.now(timezone.utc)
+    ts_cache: dict = {}
+
+    def timestamp(spec):
+        fmt = spec or TS_DEFAULT_FMT
+        if fmt not in ts_cache:
+            ts_cache[fmt] = ts_base.strftime(fmt)
+        return ts_cache[fmt]
+
+    models = args.models
+    start = args.start
+    total = (len(prompts) - start) * len(models) * args.count
+    succeeded = failed = processed = 0
+    image_counter = start * len(models) * args.count
+
+    t0 = time.monotonic()
+
+    def _eta(completed: int) -> float | None:
+        """Remaining time from the average wall time per image so far (None if < 1)."""
+        if completed < 1:
+            return None
+        return (time.monotonic() - t0) / completed * (total - completed)
+    segs = parse_fmt(effective_fmt(args))
+
+    def emit(record: dict) -> None:
+        if args.json_out:
+            sys.stdout.write(json.dumps(record, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+    def emit_summary(exit_code: int) -> None:
+        emit({"type": "summary", "planned": total, "succeeded": succeeded,
+              "failed": failed, "start": start, "out_dir": str(out_dir),
+              "exit_code": exit_code})
+
+    for prompt_idx, prompt in enumerate(prompts):
+        if prompt_idx < start:
+            continue
+        for model_idx, model in enumerate(models):
+            body = make_request_body(args, model, prompt)
+            eta = _eta(processed)
+            prog.say(f"{progress_label(processed + 1, total, eta)} {model} "
+                     f"prompt {prompt_idx}/{len(prompts) - 1}: "
+                     f"requesting {args.count} image(s)")
+            prog.say_wrapped(prompt, prefix=" > ")
+            try:
+                data = post_generation(args.base_url, body, args.timeout)
+            except BackendUnreachable as e:
+                prog.err(f"backend unreachable: {e}")
+                prog.err(f"cannot reach Lemonade backend at {args.base_url} — "
+                         "is lemond running? Check --base-url.")
+                emit_summary(EXIT_UNREACHABLE)
+                return EXIT_UNREACHABLE
+            except BackendError as e:
+                failed += args.count
+                processed += args.count
+                emit(_image_record(model, model_idx, prompt, prompt_idx,
+                                   None, None, None, "error", str(e), None))
+                prog.err(f"[{model}] prompt {prompt_idx}: FAILED: {e}")
+                continue
+
+            for batch_idx, entry in enumerate(data):
+                filename = render_filename(segs, {
+                    "model": sanitize_component(model),
+                    "prompt": prompt_idx,
+                    "model_idx": model_idx,
+                    "prompt_idx": prompt_idx,
+                    "batch_idx": batch_idx,
+                    "image_idx": image_counter,
+                    "timestamp": timestamp,
+                    "ext": args.ext,
+                })
+                path = out_dir / filename
+                gen_info = entry.get("generation_info") if isinstance(entry, dict) else None
+                error = None
+                try:
+                    b64 = entry.get("b64_json") if isinstance(entry, dict) else None
+                    if not isinstance(b64, str) or not b64:
+                        raise ValueError("entry has no 'b64_json'")
+                    raw_bytes = base64.b64decode(b64, validate=True)
+                    if not raw_bytes:
+                        raise ValueError("decoded image data is empty")
+                    path.write_bytes(raw_bytes)
+                except (ValueError, binascii.Error, OSError) as e:
+                    error = f"decode/write failed: {e}"
+                if error is None:
+                    succeeded += 1
+                    emit(_image_record(model, model_idx, prompt, prompt_idx,
+                                       batch_idx, image_counter, str(path),
+                                       "ok", None, gen_info))
+                    eta = _eta(processed + 1)
+                    prog.say(f"{progress_label(processed + 1, total, eta)} "
+                             f"wrote {filename}")
+                else:
+                    failed += 1
+                    emit(_image_record(model, model_idx, prompt, prompt_idx,
+                                       batch_idx, image_counter, None,
+                                       "error", error, None))
+                    prog.err(f"[{model}] prompt {prompt_idx} image {batch_idx}: FAILED: {error}")
+                processed += 1
+                image_counter += 1
+
+    exit_code = EXIT_OK if failed == 0 else EXIT_BACKEND_ERR
+    emit_summary(exit_code)
+    if failed:
+        prog.say(f"done: {succeeded}/{total} images written to {out_dir} ({failed} failed)")
+    else:
+        prog.say(f"done: {succeeded}/{total} images written to {out_dir}")
+    return exit_code
+
+
+def cmd_dry_run(args: argparse.Namespace, prompts: list) -> int:
+    start = args.start
+    n_requests = (len(prompts) - start) * len(args.models)
+    total = n_requests * args.count
+    window = f", start {start} of {len(prompts)} prompts" if start > 0 else ""
+    sys.stdout.write(f"# dry-run: {n_requests} request(s), {total} image(s) planned "
+                     f"(base {args.base_url}{window})\n")
+    for prompt_idx, prompt in enumerate(prompts):
+        if prompt_idx < start:
+            continue
+        for model_idx, model in enumerate(args.models):
+            sys.stdout.write(f"## POST {args.base_url}{GEN_ENDPOINT}\n")
+            sys.stdout.write(json.dumps(make_request_body(args, model, prompt),
+                                        indent=2, ensure_ascii=False) + "\n")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.list_models:
+            return cmd_list(args)
+        validate_args(args)
+        if args.recipe is not None:
+            raise UsageError("--recipe is only valid with --list")
+        args.base_url = args.base_url.strip().rstrip("/")
+
+        prompts = collect_prompts(args, sys.stdin.isatty())
+        apply_start(prompts, args.start)
+
+        if args.dry_run:
+            return cmd_dry_run(args, prompts)
+
+        prog = Progress(args.quiet, args.verbose)
+        try:
+            check_connectivity(args.base_url, args.timeout)
+        except BackendUnreachable:
+            prog.err(f"cannot reach Lemonade backend at {args.base_url} — "
+                     "is lemond running? Check --base-url.")
+            return EXIT_UNREACHABLE
+        return run_generation(args, prompts, prog)
+    except UsageError as e:
+        sys.stderr.write(f"{e}\n")
+        return EXIT_USAGE
+    except NoWorkError as e:
+        sys.stderr.write(f"{e}\n")
+        return EXIT_NO_WORK
+    except InternalError as e:
+        sys.stderr.write(f"{PROG}: {e}\n")
+        return EXIT_INTERNAL
+    except KeyboardInterrupt:
+        sys.stderr.write(f"{PROG}: interrupted\n")
+        return 130
+    except Exception as e:  # unexpected internal error
+        sys.stderr.write(f"{PROG}: internal error: {type(e).__name__}: {e}\n")
+        return EXIT_INTERNAL
+
+
+if __name__ == "__main__":
+    sys.exit(main())

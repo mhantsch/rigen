@@ -1,0 +1,981 @@
+#!/usr/bin/env python3
+"""riview — Reloading Image Viewer.
+
+Watches a directory (or a single image file, R21) and always displays the
+newest image in it. When a newer image appears, or the displayed file is
+updated, the view updates automatically.
+
+Specification & design: RIVIEW-SW-SPEC-AND-DESIGN.md (spec §§1–11,
+design §§12–13), rev 1.0.
+
+Single file, no pip dependencies: Python 3.10+ with system PyGObject
+(GTK 4 + libadwaita) for GUI mode. `--print` and the desktop flags need no
+display.
+"""
+
+import argparse
+import os
+import queue
+import signal
+import stat as statmod
+import sys
+import threading
+import time
+import urllib.parse
+
+VERSION = "1.0.0"
+
+# Exit codes (spec §8)
+OK = 0
+USAGE = 2
+NO_TARGET = 3
+INTERNAL = 1
+
+# Defaults (spec §4.1, design §12.3)
+DEFAULT_EXTENSIONS = "png,jpg,jpeg,webp,gif,tiff,tif,bmp"
+DEFAULT_EXTENSIONS_SET = frozenset(DEFAULT_EXTENSIONS.split(","))
+DEFAULT_STABLE_MS = 2000
+COALESCE_MS = 200      # inotify event coalescing (spec §6.1)
+FALLBACK_POLL_S = 1.0  # automatic polling fallback interval (spec §6.1)
+RECHECK_MS = 1000      # deleted-directory recheck interval (spec §6.1)
+PUMP_MS = 16           # decode-result pump period (design §12.4)
+OVERSAMPLE = 2         # decode oversample factor (spec §7.1)
+DOUBLE_CLICK_S = 0.4   # canvas double-click press window (R19, §12.9)
+APP_ID = "com.lemonade.riview"
+
+# Desktop entry & idle state (rev 0.8; R20, R22). The icon is embedded so
+# the script stays self-contained (D6); --install-desktop writes it to the
+# user's icon directory (R20).
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="104" fill="#181a2e"/>
+  <rect x="100" y="132" width="312" height="248" rx="26" fill="#0e1020"
+        stroke="#aab6e8" stroke-width="22"/>
+  <circle cx="204" cy="222" r="34" fill="#f2c14e"/>
+  <path d="M120 358 L228 244 L300 316 L348 268 L392 358 Z" fill="#7fa8e0"/>
+  <path d="M376 96 A118 118 0 0 1 452 200" fill="none" stroke="#57d9a3"
+        stroke-width="26" stroke-linecap="round"/>
+  <path d="M462 138 L474 214 L398 186 Z" fill="#57d9a3"/>
+</svg>
+"""
+DESKTOP_MIMETYPES = ("inode/directory;image/png;image/jpeg;image/webp;"
+                     "image/gif;image/tiff;image/bmp;")
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Version=1.0
+Name=riview
+Comment=Reloading image viewer
+Exec={exec} %U
+Icon={icon}
+Terminal=false
+Categories=Utility;Viewer;Graphics;
+MimeType={mime}
+"""
+IDLE_TEXT = ("No target given. Right-click a folder or an image and choose "
+             "\"Open with riview\", or pass a directory or file on the "
+             "command line.")
+
+
+class UsageError(Exception):
+    """Any exit-2 condition (spec §4.2)."""
+
+
+class NoTargetError(Exception):
+    """Target does not exist at startup (exit 3)."""
+
+    def __init__(self, path):
+        super().__init__(str(path))
+        self.path = path
+
+
+# ---------------------------------------------------------------------------
+# Selection layer — pure, unit-tested (spec §5, design §12.3 item 3)
+# ---------------------------------------------------------------------------
+
+def parse_extensions(spec):
+    """Parse an --extensions value into a set (spec §4.1/§4.2)."""
+    if spec is None:
+        return set(DEFAULT_EXTENSIONS.split(","))
+    tokens = [t.strip().lower() for t in spec.split(",")]
+    tokens = [t for t in tokens if t != ""]
+    if not tokens:
+        raise UsageError("--extensions: empty list")
+    for t in tokens:
+        if "/" in t:
+            raise UsageError(f"--extensions: '{t}' contains '/'")
+        if t.startswith("."):
+            raise UsageError(f"--extensions: '{t}' must not start with '.'")
+    return set(tokens)
+
+
+def extension_of(name):
+    if "." not in name:
+        return None
+    return name.rsplit(".", 1)[1].lower()
+
+
+def scan_candidates(dir_path, exts):
+    """List the candidates of dir_path (spec §5.1).
+
+    Returns [(path, mtime_ns, size)] with absolute paths. Never raises:
+    a missing/unreadable directory yields [].
+    """
+    out = []
+    try:
+        entries = list(os.scandir(dir_path))
+    except OSError:
+        return out
+    for entry in entries:
+        name = entry.name
+        if name.startswith("."):
+            continue
+        ext = extension_of(name)
+        if ext is None or ext not in exts:
+            continue
+        try:
+            st = entry.stat(follow_symlinks=True)
+        except OSError:
+            continue  # broken symlink etc.; may become valid on a later rescan
+        if not statmod.S_ISREG(st.st_mode):
+            continue
+        out.append((os.path.join(dir_path, name), st.st_mtime_ns, st.st_size))
+    return out
+
+
+class Observed:
+    """Per-path observed state (spec §5.3)."""
+    __slots__ = ("mtime_ns", "size", "last_change_mono")
+
+    def __init__(self, mtime_ns, size, last_change_mono):
+        self.mtime_ns = mtime_ns
+        self.size = size
+        self.last_change_mono = last_change_mono
+
+
+def update_observed(obs_map, cands, now_mono, now_wall):
+    """Update per-path observed state (spec §5.3). Mutates and returns obs_map."""
+    seen = set()
+    for path, mtime_ns, size in cands:
+        seen.add(path)
+        prev = obs_map.get(path)
+        if prev is None:
+            # First sighting: presume the last change happened at the file's
+            # own mtime (clamped to now) — the mtime-age fast path (§5.3):
+            # a pre-existing file older than the window settles immediately.
+            age = max(0.0, now_wall - mtime_ns / 1e9)
+            obs_map[path] = Observed(mtime_ns, size, now_mono - age)
+        elif (prev.mtime_ns, prev.size) != (mtime_ns, size):
+            obs_map[path] = Observed(mtime_ns, size, now_mono)
+        # else: unchanged — keep last_change_mono
+    for p in [p for p in obs_map if p not in seen]:
+        del obs_map[p]
+    return obs_map
+
+
+def is_settled(obs, now_mono, now_wall, window_s):
+    """Spec §5.3: quiet for the settle window by both observed and mtime age."""
+    if obs is None:
+        return False
+    return ((now_mono - obs.last_change_mono >= window_s)
+            and (now_wall - obs.mtime_ns / 1e9 >= window_s))
+
+
+class Snapshot:
+    """Identity of the currently displayed image (spec §2)."""
+    __slots__ = ("path", "mtime_ns", "size", "width", "height")
+
+    def __init__(self, path, mtime_ns, size, width=0, height=0):
+        self.path = path
+        self.mtime_ns = mtime_ns
+        self.size = size
+        self.width = width
+        self.height = height
+
+
+def pick_best(settled, snapshot):
+    """Spec §5.2: which path belongs on display, or None.
+
+    settled: [(path, mtime_ns, size)]; snapshot: Snapshot | None.
+    """
+    if not settled:
+        return None
+    cur_unchanged = False
+    if snapshot is not None:
+        for path, mtime_ns, size in settled:
+            if path == snapshot.path:
+                if (mtime_ns, size) == (snapshot.mtime_ns, snapshot.size):
+                    cur_unchanged = True
+                else:
+                    # In-place update of the displayed file (R4): reload it,
+                    # whatever the mtime direction.
+                    return path
+                break
+    if cur_unchanged:
+        # Switch to a *different* file only if strictly newer (newer-only).
+        newer = [c for c in settled
+                 if c[0] != snapshot.path and c[1] > snapshot.mtime_ns]
+        if newer:
+            return max(newer, key=lambda c: (c[1], c[0]))[0]
+        return snapshot.path
+    # No valid current: the overall newest (ties → lexicographically greatest).
+    return max(settled, key=lambda c: (c[1], c[0]))[0]
+
+
+def newest_for_report(cands):
+    """`--print` (spec §4.3): greatest mtime; ties → greatest name. No settle."""
+    if not cands:
+        return None
+    return max(cands, key=lambda c: (c[1], c[0]))[0]
+
+
+# ---------------------------------------------------------------------------
+# Launch context & target resolution (rev 0.8; R20–R22, §4.6)
+# ---------------------------------------------------------------------------
+
+def has_controlling_tty():
+    """True iff this process has a controlling terminal (R22 probe)."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def is_gui_context(environ=None, has_ctty=None):
+    """R22: GUI context ⇔ DESKTOP_STARTUP_ID set, or no controlling terminal.
+
+    Documented convenience heuristic (§4.6). `environ` and `has_ctty` are
+    injectable for unit tests; production uses os.environ + a live probe.
+    """
+    env = os.environ if environ is None else environ
+    if env.get("DESKTOP_STARTUP_ID"):
+        return True
+    if has_ctty is None:
+        has_ctty = has_controlling_tty()
+    return not has_ctty
+
+
+def uri_to_path(target):
+    """Accept `file://` URIs as targets (the .desktop entry's %U, R20)."""
+    if target.startswith("file://"):
+        return urllib.parse.unquote(urllib.parse.urlparse(target).path)
+    return target
+
+
+def resolve_target(raw_target, gui_context):
+    """Resolve the target to (mode, abs_path); mode in {"dir","file","none"}.
+
+    R21: dir -> directory mode; image file -> single-file mode (default
+    extension set only); other file -> UsageError (exit 2); missing ->
+    NoTargetError (exit 3). R22: no target -> CWD in a terminal context,
+    idle state ("none") in a GUI context.
+    """
+    if raw_target is not None:
+        path = os.path.abspath(uri_to_path(raw_target))
+        if not os.path.exists(path):
+            raise NoTargetError(path)
+        if os.path.isdir(path):
+            return "dir", path
+        if extension_of(os.path.basename(path)) in DEFAULT_EXTENSIONS_SET:
+            return "file", path
+        raise UsageError(
+            "target is not a directory or a supported image file: " + path)
+    if gui_context:
+        return "none", None
+    return "dir", os.path.abspath(".")
+
+
+# ---------------------------------------------------------------------------
+# CLI (spec §4)
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="riview",
+        description="Reloading Image Viewer — watch a directory and always "
+                    "display its newest image.",
+    )
+    p.add_argument("target", nargs="?", default=None,
+                   help="directory or image file to watch (default: the "
+                        "current working directory when launched from a "
+                        "terminal; idle state in a GUI context — R22)")
+    p.add_argument("--extensions", default=DEFAULT_EXTENSIONS, metavar="LIST",
+                   help="comma-separated candidate extensions (default: %(default)s)")
+    p.add_argument("--stable-ms", type=int, default=DEFAULT_STABLE_MS, metavar="MS",
+                   help="settle window in milliseconds; 0 disables (default: %(default)s)")
+    p.add_argument("--poll", type=float, default=None, metavar="SECONDS",
+                   help="poll every SECONDS instead of using inotify (also the "
+                        "fallback interval when given)")
+    p.add_argument("--max-dim", type=int, default=0, metavar="PX",
+                   help="cap on the longer side of the decoded image, in pixels; "
+                        "0 = no cap (default: %(default)s)")
+    p.add_argument("--fullscreen", action="store_true",
+                   help="start in full screen")
+    p.add_argument("--print", action="store_true",
+                   help="print the absolute path of the image riview would "
+                        "display (or 'none') and exit; no GUI, no settle wait")
+    p.add_argument("--install-desktop", action="store_true",
+                   help="install the per-user .desktop entry + icon (R20) "
+                        "and exit")
+    p.add_argument("--uninstall-desktop", action="store_true",
+                   help="remove the per-user .desktop entry + icon (R20) "
+                        "and exit")
+    p.add_argument("--version", action="store_true",
+                   help="print version and exit")
+    return p
+
+
+def validate(args):
+    """Apply §4.2 option validation; raises UsageError (exit 2).
+
+    Target resolution (exit 2/3, R21/R22) happens in main() via
+    resolve_target, since it depends on the launch context.
+    """
+    if args.stable_ms < 0:
+        raise UsageError(f"--stable-ms must be >= 0 (got {args.stable_ms})")
+    if args.poll is not None and args.poll <= 0:
+        raise UsageError(f"--poll must be > 0 (got {args.poll})")
+    if args.max_dim < 0:
+        raise UsageError(f"--max-dim must be >= 0 (got {args.max_dim})")
+    if args.print and args.fullscreen:
+        raise UsageError("--print is incompatible with --fullscreen")
+    args.exts = parse_extensions(args.extensions)
+    return args
+
+
+def run_print(mode, path, args):
+    """R12: headless query — print the path of the image riview would
+    display (absolute path, or 'none'); point-in-time, no settle wait."""
+    if mode == "file":
+        print(path)
+        return OK
+    cands = scan_candidates(path, args.exts)
+    best = newest_for_report(cands)
+    print(os.path.abspath(best) if best else "none")
+    return OK
+
+
+def desktop_paths():
+    """R20: per-user .desktop entry and icon locations (XDG_DATA_HOME-aware)."""
+    data = os.path.expanduser(
+        os.environ.get("XDG_DATA_HOME") or "~/.local/share")
+    return (os.path.join(data, "applications", APP_ID + ".desktop"),
+            os.path.join(data, "icons", "hicolor", "scalable", "apps",
+                         APP_ID + ".svg"))
+
+
+def run_desktop_install(args):
+    """R20: install/uninstall the desktop entry + icon (headless, idempotent)."""
+    if args.install_desktop and args.uninstall_desktop:
+        raise UsageError(
+            "--install-desktop and --uninstall-desktop are mutually exclusive")
+    if args.target is not None or args.print or args.fullscreen:
+        raise UsageError(
+            "desktop install/uninstall cannot be combined with a target, "
+            "--print, or --fullscreen")
+    entry, icon = desktop_paths()
+    if args.install_desktop:
+        for p in (entry, icon):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(entry, "w", encoding="utf-8") as f:
+            f.write(DESKTOP_ENTRY.format(exec=os.path.realpath(__file__),
+                                         icon=APP_ID, mime=DESKTOP_MIMETYPES))
+        with open(icon, "w", encoding="utf-8") as f:
+            f.write(ICON_SVG)
+        return OK
+    # --uninstall-desktop: idempotent removal; a note when there is nothing.
+    removed = False
+    for p in (entry, icon):
+        try:
+            os.remove(p)
+            removed = True
+        except FileNotFoundError:
+            pass
+    if not removed:
+        print("riview: note: no desktop entry installed; nothing removed",
+              file=sys.stderr)
+    return OK
+
+
+# ---------------------------------------------------------------------------
+# GUI (spec §6–§7, design §12.4–§12.7).
+# GTK/GdkPixbuf are imported here and in the decoder thread only, so that
+# `--print` and the desktop flags stay clean in display-less sessions (spec
+# §13.3).
+# ---------------------------------------------------------------------------
+
+def _gui_classes():
+    """Define the GUI-layer classes. GTK is imported here (lazily) so that
+    `--print` and the desktop flags stay clean in display-less sessions
+    (spec §13.3).
+
+    Split out of run_gui so the inotify/decode plumbing (Decoder, Watcher)
+    is reachable from the headless test suite.
+    """
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("Adw", "1")
+    gi.require_version("Pango", "1.0")
+    from gi.repository import Adw, Gtk, Gdk, Gio, GLib, Pango
+
+    class Decoder:
+        """Single decode worker thread + queues (design §12.4/§12.5)."""
+
+        def __init__(self):
+            self._req = queue.Queue()
+            self._res = queue.Queue()
+            self._thread = threading.Thread(target=self._run,
+                                            name="riview-decode", daemon=True)
+            self._thread.start()
+
+        def _run(self):
+            import gi as _gi
+            _gi.require_version("GdkPixbuf", "2.0")
+            from gi.repository import GdkPixbuf
+            pb = GdkPixbuf.Pixbuf
+            while True:
+                item = self._req.get()
+                if item is None:
+                    return
+                gen, path, w, h = item
+                try:
+                    # Never upscale beyond the source's native size (§7.1).
+                    # get_file_info returns (format|None, width, height) —
+                    # (None, -1, -1) when the header cannot be read.
+                    info = pb.get_file_info(path)
+                    sw = sh = 0
+                    if info is not None and len(info) == 3:
+                        _fmt, b, c = info
+                        if isinstance(b, int) and isinstance(c, int) and b > 0 and c > 0:
+                            sw, sh = b, c
+                    if sw:
+                        tw, th = min(w, sw), min(h, sh)
+                    else:
+                        tw, th = w, h
+                    pixbuf = pb.new_from_file_at_scale(path, max(tw, 1), max(th, 1), True)
+                    if pixbuf is None:
+                        raise GLib.Error("pixbuf load returned null")
+                    self._res.put((gen, path, pixbuf, None))
+                except Exception as e:
+                    self._res.put((gen, path, None, e))
+
+        def request(self, gen, path, w, h):
+            self._req.put((gen, path, w, h))
+
+        def results(self):
+            out = []
+            while True:
+                try:
+                    out.append(self._res.get_nowait())
+                except queue.Empty:
+                    return out
+
+        def stop(self):
+            self._req.put(None)
+
+    class Watcher:
+        """Directory watcher (spec §6): inotify via Gio.File.monitor with
+        coalesced rescans, optional polling, deleted-directory recovery."""
+
+        def __init__(self, path, poll_s, on_rescan):
+            self.path = path
+            self.poll_s = poll_s
+            self.on_rescan = on_rescan
+            self.monitor = None
+            self.inode = None
+            self._known_gone = False
+            self._tick = 0
+            self._rescan_pending = False
+            self._rescan_id = None
+            self._poll_id = None
+            self._recheck_id = None
+
+        def start(self):
+            st = os.stat(self.path)
+            self.inode = (st.st_dev, st.st_ino)
+            if self.poll_s is None:
+                self._make_monitor()
+                # Safety net: an inotify monitor can go silent (directory
+                # deleted/recreated, watch dropped) and then no events ever
+                # arrive — so inotify mode also re-stats the path periodically.
+                self._recheck_id = GLib.timeout_add(RECHECK_MS, self._recheck)
+            else:
+                self._start_poll()
+            self.schedule_rescan(0)
+
+        def stop(self):
+            for attr in ("_rescan_id", "_poll_id", "_recheck_id"):
+                sid = getattr(self, attr)
+                if sid is not None:
+                    GLib.source_remove(sid)
+                    setattr(self, attr, None)
+            self.monitor = None
+
+        def schedule_rescan(self, delay_ms=COALESCE_MS):
+            if self._rescan_pending:
+                return
+            self._rescan_pending = True
+            self._rescan_id = GLib.timeout_add(delay_ms, self._do_rescan)
+
+        # -- rescan plumbing ------------------------------------------------
+        def _do_rescan(self):
+            self._rescan_pending = False
+            self._rescan_id = None
+            try:
+                self.on_rescan()
+            except Exception as e:
+                print(f"riview: warning: rescan failed: {e}", file=sys.stderr)
+            return False
+
+        # -- inotify ---------------------------------------------------------
+        def _make_monitor(self):
+            try:
+                m = Gio.File.new_for_path(self.path).monitor(
+                    Gio.FileMonitorFlags.NONE, None)
+                m.connect("changed", self._on_changed)
+                # NOTE: GInotifyFileMonitor exposes no "cancelled" signal on
+                # this GLib; the _recheck timer covers the silent case.
+                self.monitor = m
+                return True
+            except GLib.Error as e:
+                print(f"riview: warning: inotify monitor unavailable "
+                      f"({e.message}); falling back to polling every "
+                      f"{FALLBACK_POLL_S}s", file=sys.stderr)
+                self._fallback_poll()
+                return False
+
+        def _on_changed(self, monitor, file, other_file, event_type):
+            self.schedule_rescan()
+
+        # -- polling / recheck -----------------------------------------------
+        def _start_poll(self):
+            if self._poll_id is None:
+                self._poll_id = GLib.timeout_add(int(self.poll_s * 1000),
+                                                 self._poll_tick)
+
+        def _fallback_poll(self):
+            if self.poll_s is None:
+                self.poll_s = FALLBACK_POLL_S
+            self._start_poll()
+
+        def _poll_tick(self):
+            # Polling self-heals (the directory is re-statted every tick),
+            # so no inode bookkeeping is needed in poll mode.
+            self.on_rescan()
+            return True
+
+        def _recheck(self):
+            """Periodic safety net in inotify mode (spec §6.1, R14).
+
+            inotify watches are per directory *instance*: if the directory
+            is deleted and recreated — even under a reused inode number —
+            the old monitor is silently dead and no events ever arrive
+            again. Re-creating the monitor every tick is a couple of
+            syscalls and bounds recovery to RECHECK_MS regardless of how
+            the recreation happened; the post-swap rescan re-derives state
+            from disk, so nothing is lost in the (microsecond) swap gap.
+            """
+            if self.poll_s is not None:
+                # Fell back to polling: the poll tick covers everything.
+                self._recheck_id = None
+                return False
+            try:
+                st = os.stat(self.path)
+            except OSError:
+                if not self._known_gone:
+                    self._known_gone = True
+                    self.schedule_rescan(0)  # clear display to waiting state
+                return True
+            if not statmod.S_ISDIR(st.st_mode):
+                return True
+            was_gone = self._known_gone
+            self._known_gone = False
+            cur = (st.st_dev, st.st_ino)
+            self.monitor = None
+            self._make_monitor()
+            if was_gone or (self.inode is not None and cur != self.inode) \
+                    or self._tick % 5 == 0:
+                self.schedule_rescan(0)  # periodic safety-net rescan too
+            self.inode = cur
+            self._tick += 1
+            return True
+
+    class RiviewWindow(Adw.ApplicationWindow):
+        # R18: modifiers allowed on the bare-key shortcuts (Shift + locks).
+        # The binding exposes no IS_* masks, so plain masks only (§13.2).
+        _PERMITTED_MODS = (int(Gdk.ModifierType.SHIFT_MASK)
+                           | int(Gdk.ModifierType.LOCK_MASK))
+
+        def __init__(self, app, args):
+            super().__init__(application=app)
+            self.args = args
+            # Target modes (rev 0.8; R21/R22): "dir", "file", "none".
+            self.mode = args.mode
+            if self.mode == "file":
+                # Single-file mode: watch the containing directory but only
+                # ever consider the target path itself (R21).
+                self.only_path = args.target_abs
+                self.file_name = os.path.basename(self.only_path)
+                self.dir_abs = os.path.dirname(self.only_path)
+                self.exts = {extension_of(self.file_name)}
+                self._subtitle = self.only_path
+            else:
+                self.only_path = None
+                self.file_name = None
+                self.dir_abs = args.target_abs or ""
+                self.exts = args.exts
+                self._subtitle = self.dir_abs
+            self.window_s = args.stable_ms / 1000.0
+            self.max_dim = args.max_dim
+            self.observer = {}
+            self.snapshot = None
+            self.failed_versions = set()
+            self.current_gen = 0
+            self._last_canvas_click_s = -1.0
+
+            # Window icon: the desktop icon when installed (R20), else a
+            # generic fallback so the decoration still reads "image".
+            self.set_icon_name(APP_ID if os.path.exists(desktop_paths()[1])
+                               else "image-x-generic")
+            self.set_title("riview")
+
+            # -- black canvas (R17): the letterbox around the image ------
+            # USER priority beats the theme and libadwaita's own providers.
+            css = Gtk.CssProvider()
+            css.load_from_string(
+                "window { background-color: #000000; }\n"
+                ".riview-waiting { color: #ffffff; }")
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(),
+                css,
+                Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+            # -- layout (design §12.7) --------------------------------------
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+            header = Adw.HeaderBar()
+            self.header = header
+            self.title_widget = Adw.WindowTitle()
+            self.title_widget.set_title("riview")
+            self.title_widget.set_subtitle(self._subtitle)
+            header.set_title_widget(self.title_widget)
+
+            self.picture = Gtk.Picture()
+            # content-fit=CONTAIN keeps the aspect ratio (set_keep_aspect_ratio
+            # is deprecated in GTK >= 4.10 and a no-op with CONTAIN).
+            self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+            self.picture.set_can_shrink(True)
+            self.picture.set_hexpand(True)
+            self.picture.set_vexpand(True)
+
+            self.waiting_label = Gtk.Label()
+            self.waiting_label.add_css_class("riview-waiting")
+            self.waiting_label.set_halign(Gtk.Align.CENTER)
+            self.waiting_label.set_valign(Gtk.Align.CENTER)
+            self.waiting_label.set_justify(Gtk.Justification.CENTER)
+            # Wrapping for the idle-state message (R22) and long file names.
+            self.waiting_label.set_wrap(True)
+            self.waiting_label.set_wrap_mode(Pango.WrapMode.WORD)
+            self.waiting_label.set_max_width_chars(60)
+            self.waiting_label.set_margin_start(24)
+            self.waiting_label.set_margin_end(24)
+            self.waiting_label.set_visible(False)
+            wrap = Gtk.Box()
+            wrap.set_halign(Gtk.Align.CENTER)
+            wrap.set_valign(Gtk.Align.CENTER)
+            wrap.append(self.waiting_label)
+
+            overlay = Gtk.Overlay()
+            overlay.set_child(self.picture)
+            overlay.add_overlay(wrap)
+
+            # -- canvas double-click: toggle full screen (R19) --------------
+            # Button 1, two presses within DOUBLE_CLICK_S. The overlay covers
+            # picture + letterbox + waiting label (header bar excluded). The
+            # binding has no Gtk.GestureMultiPress (§13.2), hence manual.
+            dbl = Gtk.GestureClick()
+            dbl.set_button(1)
+            dbl.connect("pressed", self._on_canvas_click)
+            overlay.add_controller(dbl)
+
+            vbox.append(header)
+            vbox.append(overlay)
+            self.set_content(vbox)
+
+            # -- full screen: image only, no chrome (R16) -----------------
+            self.fullscreen_mode = args.fullscreen
+            if self.fullscreen_mode:
+                header.set_visible(False)
+
+            # -- initial size / full screen (D11, R16) -----------------------
+            init_w, init_h = self._init_size()
+            self._init_w, self._init_h = init_w, init_h
+            self.set_default_size(init_w, init_h)
+
+            # -- keyboard shortcuts (R18, design §12.9) --------------------
+            # Installed before the services so the idle state also has
+            # q/f/Esc (R22).
+            keys = Gtk.EventControllerKey()
+            keys.connect("key-pressed", self._on_key)
+            self.add_controller(keys)
+
+            # -- services ------------------------------------------------------
+            # Idle state (mode "none", R22): nothing to watch — no decoder,
+            # watcher, or pump; the canvas shows the explanatory message.
+            if self.mode == "none":
+                self.decoder = None
+                self.watcher = None
+                self._pump_id = None
+                self.waiting_label.set_text(IDLE_TEXT)
+                self.waiting_label.set_visible(True)
+                self.title_widget.set_subtitle("no file")
+                return
+            self.decoder = Decoder()
+            self.watcher = Watcher(self.dir_abs, args.poll, self.on_rescan)
+            self.watcher.start()
+            self._pump_id = GLib.timeout_add(PUMP_MS, self._pump)
+
+        def _init_size(self):
+            # 80% of the primary monitor work area, min 900x675 (D11).
+            try:
+                display = Gdk.Display.get_default()
+                mon = display.get_primary_monitor() or display.get_monitor(0)
+                sf = mon.get_scale_factor() or 1
+                w = max(int(mon.get_width() / sf * 0.8), 900)
+                h = max(int(mon.get_height() / sf * 0.8), 675)
+                return w, h
+            except Exception:
+                return 1280, 960
+
+        def decode_target(self):
+            # 2x scale_factor x window, capped by --max-dim on the longer side.
+            w = self.get_width() or self._init_w
+            h = self.get_height() or self._init_h
+            sf = self.get_scale_factor() or 1
+            W = max(OVERSAMPLE * sf * w, 1)
+            H = max(OVERSAMPLE * sf * h, 1)
+            if self.max_dim > 0:
+                L = max(W, H)
+                if L > self.max_dim:
+                    k = self.max_dim / L
+                    W = max(int(W * k), 1)
+                    H = max(int(H * k), 1)
+            return W, H
+
+        # -- rescan + selection (spec §5/§6) ---------------------------------
+        def on_rescan(self):
+            cands = scan_candidates(self.dir_abs, self.exts)
+            if self.only_path is not None:  # single-file mode (R21)
+                cands = [c for c in cands if c[0] == self.only_path]
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            update_observed(self.observer, cands, now_mono, now_wall)
+            settled = [c for c in cands
+                       if is_settled(self.observer[c[0]], now_mono, now_wall,
+                                     self.window_s)]
+            best = pick_best(settled, self.snapshot)
+            if best is None:
+                self.show_waiting(None)
+                return
+            obs = self.observer[best]
+            if (self.snapshot is not None and best == self.snapshot.path
+                    and obs.mtime_ns == self.snapshot.mtime_ns
+                    and obs.size == self.snapshot.size):
+                return  # already showing this exact file version
+            # Dual buffer: the display is touched only in _on_load_ok (§5.4).
+            self.current_gen += 1
+            self.decoder.request(self.current_gen, best, *self.decode_target())
+
+        # -- display state (spec §5.4, R8, R10) --------------------------------
+        def show_waiting(self, error_path):
+            self.picture.set_paintable(None)
+            self.snapshot = None
+            if error_path:
+                self.waiting_label.set_text(
+                    f"Could not load {os.path.basename(error_path)} — see stderr")
+            elif self.mode == "file":
+                self.waiting_label.set_text(
+                    f"Waiting for {self.file_name} to settle…")
+            else:
+                self.waiting_label.set_text("Waiting for images…")
+            self.waiting_label.set_visible(not self.fullscreen_mode)  # R16
+            self.title_widget.set_title("riview")
+            self.title_widget.set_subtitle(self._subtitle)
+            self.set_title("riview")
+
+        def _pump(self):
+            for gen, path, pixbuf, error in self.decoder.results():
+                if gen != self.current_gen:
+                    continue  # superseded (design §12.5)
+                if error is not None:
+                    self._on_load_error(path, error)
+                else:
+                    self._on_load_ok(path, pixbuf)
+            return True
+
+        def _on_load_ok(self, path, pixbuf):
+            obs = self.observer.get(path)
+            mtime = obs.mtime_ns if obs else 0
+            size = obs.size if obs else 0
+            self.snapshot = Snapshot(path, mtime, size,
+                                     pixbuf.get_width(), pixbuf.get_height())
+            # set_paintable + texture: the non-deprecated display API
+            # (set_pixbuf is deprecated in GTK >= 4.10; a Pixbuf itself is
+            # not a Gdk.Paintable, so wrap it in a texture — §13.2).
+            self.picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
+            self.waiting_label.set_visible(False)
+            self.title_widget.set_title(os.path.basename(path))
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime / 1e9))
+            self.title_widget.set_subtitle(
+                f"{pixbuf.get_width()}×{pixbuf.get_height()}  ·  {ts}")
+            self.set_title(os.path.basename(path))
+
+        def _on_load_error(self, path, error):
+            obs = self.observer.get(path)
+            version = (path, obs.mtime_ns if obs else -1, obs.size if obs else -1)
+            if version not in self.failed_versions:  # warn once per version (R15)
+                self.failed_versions.add(version)
+                print(f"riview: warning: could not load {path}: {error}",
+                      file=sys.stderr)
+            if self.snapshot is None:
+                self.show_waiting(path)
+            # else: dual buffer — the current image stays (R7)
+
+        # -- keyboard shortcuts (R18, design §12.9) ------------------------
+        def _on_key(self, controller, keyval, keycode, state):
+            """q = quit; f = toggle full screen; Esc = leave full screen.
+
+            Bare keys only: any modifier beyond Shift/locks leaves the event
+            unhandled (Ctrl+q etc. are not shortcuts, §11 case 23). Works in
+            windowed and full-screen mode alike.
+            """
+            if int(state) & ~self._PERMITTED_MODS:
+                return False
+            if keyval in (Gdk.KEY_q, Gdk.KEY_Q):
+                self.close()
+                return True
+            if keyval in (Gdk.KEY_f, Gdk.KEY_F):
+                self._set_fullscreen(not self.fullscreen_mode)
+                return True
+            if keyval == Gdk.KEY_Escape and self.fullscreen_mode:
+                self._set_fullscreen(False)
+                return True
+            return False
+
+        def _set_fullscreen(self, on):
+            # We are the only code that changes full-screen state, so the
+            # flag is the source of truth (no is_fullscreened() in the
+            # binding, §13.2). Header bar follows the mode (R16).
+            self.fullscreen_mode = on
+            self.header.set_visible(not on)
+            if on:
+                self.fullscreen()
+            else:
+                self.unfullscreen()
+
+        def _on_canvas_click(self, gesture, n_presses, x, y):
+            """R19: a left double-click on the canvas toggles full screen,
+            same as `f`. The binding has no Gtk.GestureMultiPress /
+            EventControllerPointer (§13.2), so the double-click is detected
+            manually: two left presses within DOUBLE_CLICK_S.
+            """
+            now = time.monotonic()
+            if now - self._last_canvas_click_s <= DOUBLE_CLICK_S:
+                self._last_canvas_click_s = -1.0
+                self._set_fullscreen(not self.fullscreen_mode)
+            else:
+                self._last_canvas_click_s = now
+
+    class RiviewApp(Adw.Application):
+        def __init__(self, args):
+            super().__init__(application_id=APP_ID,
+                             flags=Gio.ApplicationFlags.NON_UNIQUE)
+            self.args = args
+            self.window = None
+            self.error = None  # set if window construction fails in do_activate
+            # Ctrl+C / SIGTERM → clean quit (R18, §11 case 22). C-level
+            # handlers replace Python's KeyboardInterrupt path.
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self._on_signal)
+
+        def do_activate(self):
+            # Window construction happens here (not in run_gui) so that it
+            # runs inside the GApplication context; failures are captured
+            # because GApplication swallows exceptions from signal handlers.
+            if self.window is None and self.error is None:
+                try:
+                    self.window = RiviewWindow(self, self.args)
+                    if self.args.fullscreen:
+                        self.window.fullscreen()
+                    self.window.present()
+                except Exception as e:
+                    self.error = e
+                    self.quit()
+
+        def _on_signal(self, signum):
+            self.quit()
+            return False  # one-shot
+
+        def do_shutdown(self):
+            if self.window is not None:
+                if self.window.watcher is not None:
+                    self.window.watcher.stop()
+                if self.window.decoder is not None:
+                    self.window.decoder.stop()
+                self.window = None
+            Gio.Application.do_shutdown(self)
+
+    return Decoder, Watcher, RiviewWindow, RiviewApp
+
+
+def run_gui(args):
+    Decoder, Watcher, RiviewWindow, RiviewApp = _gui_classes()
+    app = RiviewApp(args)
+    rc = app.run(None)
+    if app.error is not None:
+        print(f"riview: error: {app.error}", file=sys.stderr)
+        return INTERNAL
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"riview {VERSION}")
+        return OK
+    try:
+        if args.install_desktop or args.uninstall_desktop:
+            return run_desktop_install(args)
+        validate(args)
+        # --print ignores the launch context: no target → CWD, always (§4.3).
+        gui_ctx = is_gui_context() if not args.print else False
+        mode, path = resolve_target(args.target, gui_ctx)
+    except UsageError as e:
+        print(f"riview: error: {e}", file=sys.stderr)
+        return USAGE
+    except NoTargetError as e:
+        print(f"riview: error: target does not exist: {e.path}",
+              file=sys.stderr)
+        return NO_TARGET
+    if mode == "none" and args.fullscreen:
+        print("riview: error: --fullscreen requires a target (no target "
+              "given in a GUI context)", file=sys.stderr)
+        return USAGE
+    if args.print:
+        return run_print(mode, path, args)
+    args.mode = mode
+    args.target_abs = path
+    try:
+        return run_gui(args)
+    except Exception as e:
+        print(f"riview: error: {e}", file=sys.stderr)
+        return INTERNAL
+
+
+if __name__ == "__main__":
+    sys.exit(main())
