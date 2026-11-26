@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """riview — Reloading Image Viewer.
 
-Watches a directory (or a single image file, R21) and always displays the
-newest image in it. When a newer image appears, or the displayed file is
-updated, the view updates automatically.
+Watches a directory (or a single image file, R21) and displays the newest
+image in it. When a newer image appears, or the displayed file is updated,
+the view updates automatically. In directory mode, Left/Right step through
+the settled images (pinning the display) and n returns to the newest (R23).
+c starts the slide show — cycle mode: the settled images advance toward the
+newer end every cycle time, wrapping from the newest to the oldest (R27);
+--cycle starts in cycle mode at the oldest image (--cycle SECONDS sets the
+initial cycle time) (R29); Up/Down adjust the cycle time (R28). In full-screen
+mode the effective c/p/n/Up/Down keypresses give brief on-canvas feedback —
+a 1 s pale-yellow overlay on a gray shade (R30). On the first
+displayed load the window fits the image (--fit ratio/exact/off) and r
+re-fits on demand (R24).
 
 Specification & design: RIVIEW-SW-SPEC-AND-DESIGN.md (spec §§1–11,
-design §§12–13), rev 1.0.
+design §§12–13), rev 1.7.
 
 Single file, no pip dependencies: Python 3.10+ with system PyGObject
 (GTK 4 + libadwaita) for GUI mode. `--print` and the desktop flags need no
@@ -16,6 +25,7 @@ display.
 import argparse
 import os
 import queue
+import re
 import signal
 import stat as statmod
 import sys
@@ -23,7 +33,7 @@ import threading
 import time
 import urllib.parse
 
-VERSION = "1.0.0"
+VERSION = "1.7.0"
 
 # Exit codes (spec §8)
 OK = 0
@@ -41,6 +51,27 @@ RECHECK_MS = 1000      # deleted-directory recheck interval (spec §6.1)
 PUMP_MS = 16           # decode-result pump period (design §12.4)
 OVERSAMPLE = 2         # decode oversample factor (spec §7.1)
 DOUBLE_CLICK_S = 0.4   # canvas double-click press window (R19, §12.9)
+FIT_FLOOR = 320        # R24: minimum canvas side of a fit result, logical px
+RESIZE_TOL = 8         # R24: post-map grow tolerance, px (§13.2)
+DEFAULT_CYCLE_S = 9    # R28: cycle time, seconds (--cycle-time default)
+MIN_CYCLE_S = 1        # R28: cycle-time floor (Down at the floor: no-op)
+CYCLE_CHECK_MS = 250   # R27/§12.9: cycle-deadline check period (main thread)
+FEEDBACK_MS = 1000     # R30: full-screen keypress-overlay lifetime, ms
+FEEDBACK_BOTTOM_FRAC = 0.10  # R30: overlay bottom edge, fraction of window height
+# D15 (rev 1.3): COSMIC clamping workaround. The COSMIC compositor has an
+# upstream bug that reconfigures mapped windows larger than a certain size
+# (bug reports exist; not related to the window's position on screen).
+# The `ratio` fit box is capped at this fixed size (logical px) until the
+# COSMIC bug is fixed in an update — then raise or delete the cap.
+COSMIC_CAP_W = 1600
+COSMIC_CAP_H = 1200
+
+
+def _dbg(msg):
+    """stderr trace of fit/resize decisions, only when RIVIEW_DEBUG=1.
+    (§13.2 — keeps the normal startup quiet.)"""
+    if os.environ.get("RIVIEW_DEBUG", "") not in ("", "0"):
+        print("riview: " + msg, file=sys.stderr, flush=True)
 APP_ID = "com.lemonade.riview"
 
 # Desktop entry & idle state (rev 0.8; R20, R22). The icon is embedded so
@@ -73,6 +104,10 @@ MimeType={mime}
 IDLE_TEXT = ("No target given. Right-click a folder or an image and choose "
              "\"Open with riview\", or pass a directory or file on the "
              "command line.")
+# R23/§5.5: the pinned file ceased to be a candidate (delete/rename); the pin
+# persists — restoration is automatic when the file reappears and settles, and
+# `n` exits the state by jumping to the newest.
+IMAGE_GONE_TEXT = "Current image gone — 'n' jumps to the newest, ←/→ keep scanning."
 
 
 class UsageError(Exception):
@@ -227,6 +262,448 @@ def newest_for_report(cands):
     return max(cands, key=lambda c: (c[1], c[0]))[0]
 
 
+def order_cands(cands):
+    """Navigation list (spec §5.5): the settled candidates in §4.3 order —
+    greatest mtime first, ties broken by byte-wise greatest filename.
+    Index 0 is the newest entry."""
+    return sorted(cands, key=lambda c: (c[1], c[0]), reverse=True)
+
+
+def nav_anchor(ordered, cur, snapshot):
+    """(path, mtime) anchor of the displayed version (rev 1.5, §5.5).
+
+    The candidate's own entry when `cur` is in `ordered`; otherwise the
+    virtual position of the last known (mtime, path) of `cur` — from
+    `snapshot` when it is the displayed file — for the image-gone state
+    (the pin holds its last mtime) and a rewrite in flight.
+    """
+    for path, mtime, _size in ordered:
+        if path == cur:
+            return (path, mtime)
+    if snapshot is not None and getattr(snapshot, "path", None) == cur:
+        return (cur, snapshot.mtime_ns)
+    return (cur, 0)
+
+
+def nav_target(ordered, anchor, direction):
+    """One navigation step from `anchor` (spec §5.5, rev 1.5, R23).
+
+    ordered: the navigation list from order_cands() (index 0 = newest,
+    §4.3 order). anchor: (path, mtime) — where the displayed version
+    sorts (nav_anchor); it need not be a list member (image-gone state,
+    rewrite in flight).
+    direction: -1 = toward the older end (`Left`), +1 = toward the newer
+    end (`Right`).
+
+    Returns the first candidate path strictly on that side of the anchor
+    (the adjacent step), or None — nothing on that side: the movement
+    makes no change (the pin phase still applies, R23).
+    """
+    apath, amtime = anchor
+    if direction < 0:  # older: first candidate sorting after the anchor
+        for path, mtime, _size in ordered:
+            if (mtime, path) < (amtime, apath):
+                return path
+    else:  # newer: first candidate sorting before the anchor —
+        # iterate from the older end so the first hit is the adjacent step
+        for path, mtime, _size in reversed(ordered):
+            if (mtime, path) > (amtime, apath):
+                return path
+    return None
+
+
+def cycle_target(ordered, anchor, failed_versions):
+    """Cycle advance target (spec §5.7, rev 1.6, R27). Pure.
+
+    ordered: the navigation list from order_cands() (index 0 = newest,
+    §4.3 order). anchor: (path, mtime) — where the displayed version
+    sorts (nav_anchor); it need not be a list member (deleted slide,
+    rewrite in flight). failed_versions: the R15 set of (path, mtime,
+    size) versions that failed to decode — a failed slide is skipped,
+    never retried.
+
+    Returns the first settled candidate strictly newer than the anchor
+    (the adjacent newer image), skipping failed versions; when the
+    anchor is at the newest end (or only failed versions lie between it
+    and the newest), the OLDEST non-failed candidate (the wrap). None
+    when the list is empty or every candidate is a failed version.
+    """
+    if not ordered:
+        return None
+    apath, amtime = anchor
+    for path, mtime, size in reversed(ordered):  # from the older end, so
+        # the first hit is the adjacent newer image
+        if ((mtime, path) > (amtime, apath)
+                and (path, mtime, size) not in failed_versions):
+            return path
+    for path, mtime, size in reversed(ordered):  # wrap: oldest non-failed
+        if (path, mtime, size) not in failed_versions:
+            return path
+    return None
+
+
+def cycle_first(ordered, start_oldest, failed_versions):
+    """First slide of an armed cycle (R27/R29, §5.7). Pure.
+
+    The oldest (start_oldest — `--cycle` at startup) or newest settled
+    candidate, skipping failed versions; None when every candidate is
+    a failed version.
+    """
+    seq = reversed(ordered) if start_oldest else iter(ordered)
+    for path, mtime, size in seq:
+        if (path, mtime, size) not in failed_versions:
+            return path
+    return None
+
+
+def feedback_message(key, effective, cycle_s):
+    """R30 (§5.8): the full-screen overlay text for a feedback keypress,
+    or None (no overlay).
+
+    key: 'c' | 'p' | 'n' | 'up' | 'down'; effective: whether the keypress
+    effected its named change (the §4.4/§5.5/§5.7 no-op rules decide — a
+    no-op keypress shows nothing); cycle_s: the current cycle time. The
+    overlay is full-screen-only; the caller (Window._show_feedback) applies
+    that.
+    """
+    if not effective:
+        return None
+    if key == "c":
+        return f"cycle on: {cycle_s}s"
+    if key == "p":
+        return "pause"
+    if key == "n":
+        return "newest live image"
+    if key in ("up", "down"):
+        return f"cycle: {cycle_s}s"
+    return None
+
+
+def cycle_rescale(cycle_s, elapsed, delta):
+    """Up/Down adjustment of the cycle time (spec R28, rev 1.6). Pure.
+
+    cycle_s: the current cycle time, seconds. elapsed: the in-progress
+    interval's elapsed time, seconds. delta: +1 (Up) / -1 (Down).
+
+    Returns (new_cycle_s, remaining): the new cycle time and the seconds
+    from *now* to the next advance (deadline = now + remaining). When
+    the floor makes the adjustment a no-op (Down at 1 s), remaining is
+    None — the in-progress deadline is untouched. A new time shorter
+    than the elapsed time yields remaining 0 (advance at the next tick).
+    """
+    new = max(MIN_CYCLE_S, cycle_s + delta)
+    if new == cycle_s:
+        return cycle_s, None
+    return new, max(0.0, new - elapsed)
+
+
+def _fit_ratio(img_w, img_h, avail_w, avail_h):
+    """Largest rectangle at the image's aspect ratio that fits inside
+    (avail_w, avail_h); (w, h) in floats."""
+    k = min(avail_w / img_w, avail_h / img_h)
+    return img_w * k, img_h * k
+
+
+def fit_window(mode, img_w, img_h, box_w, box_h, screen_w, screen_h,
+               header_h, sf):
+    """Window-fit geometry (spec §5.6, R24). Pure.
+
+    mode:       "ratio" | "exact" | "off".
+    img_w/h:    the displayed image, physical pixels.
+    box_w/h:    the 80% pre-image budget box — the D11 default window size.
+    screen_w/h: the monitor the window is on, logical pixels.
+    header_h:   the header bar height (canvas = window - header).
+    sf:         the window's scale factor (physical px per logical px).
+
+    Returns (win_w, win_h) — the window size = canvas + header — or None
+    when no fit applies: "off" mode, a missing monitor box, or no canvas
+    room left after the header.
+    """
+    if mode not in ("ratio", "exact"):
+        return None
+    if min(img_w, img_h, box_w, box_h, screen_w, screen_h) <= 0:
+        return None
+    if header_h is None:
+        header_h = 0
+    sf = sf or 1
+
+    def finish(cw, ch):
+        # 320 px-per-side floor, ratio-preserving (spec §5.6). On
+        # pathologically small monitors the floor may exceed the budget —
+        # the floor wins.
+        if cw < FIT_FLOOR or ch < FIT_FLOOR:
+            cw, ch = _fit_ratio(img_w, img_h, FIT_FLOOR, FIT_FLOOR)
+        return (max(1, int(round(cw))),
+                max(1, int(round(ch)) + int(round(header_h))))
+
+    if mode == "ratio":
+        # D15: COSMIC clamping workaround — cap the 80 % budget box at a
+        # fixed logical size before fitting (the compositor reconfigures
+        # windows larger than this; upstream COSMIC bug).
+        cap_w = min(box_w, COSMIC_CAP_W)
+        cap_h = min(box_h, COSMIC_CAP_H)
+        avail_h = cap_h - header_h
+        if avail_h <= 0:
+            return None
+        return finish(*_fit_ratio(img_w, img_h, cap_w, avail_h))
+
+    # exact: 1:1 logical pixels, capped at the full monitor minus the
+    # header (a ratio fit within that cap when the image is larger).
+    cw, ch = img_w / sf, img_h / sf
+    avail_h = screen_h - header_h
+    if avail_h <= 0:
+        return None
+    if cw > screen_w or ch > avail_h:
+        cw, ch = _fit_ratio(img_w, img_h, screen_w, avail_h)
+    return finish(cw, ch)
+
+
+def probe_dimensions(data):
+    """Intrinsic pixel dimensions from an image header, or None.
+
+    R24 startup fit (§5.6): the window opens at the fit size of the
+    first image to be displayed, so the size must be known *before*
+    the first decode — from the file header alone (no Pillow, no full
+    decode). PNG, JPEG, WebP (VP8 / VP8L / VP8X), GIF, BMP. TIFF and
+    unrecognized/truncated input → None (the caller falls back to the
+    pre-image default box). Pure: bytes in, values out.
+    """
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+            w = int.from_bytes(data[16:20], "big")
+            h = int.from_bytes(data[20:24], "big")
+            if 0 < w and 0 < h:
+                return w, h
+        elif data[:2] == b"\xff\xd8":
+            # JPEG: walk segments to the first SOF (height/width follow
+            # the precision byte). C4 (DHT), C8 (JPG), CC (DAC) carry
+            # no size.
+            i = 2
+            n = len(data)
+            while i + 9 <= n:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                m = data[i + 1]
+                if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                    h = int.from_bytes(data[i + 5:i + 7], "big")
+                    w = int.from_bytes(data[i + 7:i + 9], "big")
+                    if 0 < w and 0 < h:
+                        return w, h
+                    break
+                if m in (0x00, 0x01, 0xFF) or 0xD0 <= m <= 0xD7:
+                    i += 2 if m != 0xFF else 1
+                elif i + 4 <= n:
+                    i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+                else:
+                    break
+        elif data[:3] == b"GIF" and len(data) >= 10:
+            w = int.from_bytes(data[6:8], "little")
+            h = int.from_bytes(data[8:10], "little")
+            if 0 < w and 0 < h:
+                return w, h
+        elif data[:2] == b"BM" and len(data) >= 26:
+            w = int.from_bytes(data[18:22], "little", signed=True)
+            h = int.from_bytes(data[22:26], "little", signed=True)
+            if 0 < abs(w) and 0 < abs(h):
+                return abs(w), abs(h)
+        elif data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 30:
+            chunk = data[12:16]
+            if chunk == b"VP8 " and data[20:23] == b"\x9d\x01\x2a":
+                # lossy: start code, then 14-bit width and height (LE)
+                w = int.from_bytes(data[23:25], "little") & 0x3FFF
+                h = int.from_bytes(data[25:27], "little") & 0x3FFF
+                if 0 < w and 0 < h:
+                    return w, h
+            elif chunk == b"VP8L" and data[20] == 0x2F:
+                # lossless: signature byte, then bit-packed (w-1, h-1)
+                v = int.from_bytes(data[21:25], "little")
+                return (v & 0x3FFF) + 1, ((v >> 14) & 0x3FFF) + 1
+            elif chunk == b"VP8X":
+                # extended: flag byte at 20, then le32 at 21 whose low
+                # 14 bits are width-1 and next 14 bits height-1
+                v = int.from_bytes(data[21:25], "little")
+                return (v & 0x3FFF) + 1, ((v >> 14) & 0x3FFF) + 1
+        # TIFF (II*/MM*) is deliberately not probed → None.
+        return None
+    except Exception:
+        return None
+
+
+def probe_dimensions_file(path, limit=1 << 16):
+    """Header-probe dimensions of a file, or None on any failure."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(limit)
+        return probe_dimensions(data)
+    except Exception:
+        return None
+
+
+def _monitor_logical_size(mon):
+    """Monitor (w, h) in logical pixels, or None (§12.7, §13.2).
+
+    Portable: GTK 4's gir never carried the GTK3-era
+    get_width()/get_height(), so the size comes from get_geometry() —
+    the monitor's rectangle in the display's coordinate space, in
+    logical pixels. Bindings that do expose get_width()/get_height()
+    (logical px) also work.
+    """
+    try:
+        geo = mon.get_geometry()
+        if geo is not None and geo.width and geo.height:
+            return geo.width, geo.height
+    except Exception:
+        pass
+    gw, gh = getattr(mon, "get_width", None), getattr(mon, "get_height", None)
+    if callable(gw) and callable(gh):
+        try:
+            w, h = gw(), gh()
+            if w and h:
+                return w, h
+        except Exception:
+            pass
+    return None
+
+
+def _window_size(window):
+    """The window's current logical size, or (0, 0) when unobtainable.
+
+    Preference: get_width() / get_height() (GTK >= 4.10 — the widget's
+    current allocation; works on mapped windows), then
+    get_allocated_width / get_allocated_height (only when get_width is
+    absent — on the installed binding the allocated pair is deprecated
+    and warns, §13.2), then gtk_window_get_size() — observed reporting
+    **0×0 on a mapped window** (Wayland/COSMIC, GTK 4.14.5 / PyGObject
+    3.48.2), so it is last resort only.
+    """
+    get_w = getattr(window, "get_width", None)
+    get_h = getattr(window, "get_height", None)
+    if callable(get_w) and callable(get_h):
+        try:
+            w, h = int(get_w()), int(get_h())
+            if w > 0 and h > 0:
+                return w, h
+        except Exception:
+            pass
+    get_aw = getattr(window, "get_allocated_width", None)
+    get_ah = getattr(window, "get_allocated_height", None)
+    if callable(get_aw) and callable(get_ah):
+        try:
+            w, h = int(get_aw()), int(get_ah())
+            if w > 0 and h > 0:
+                return w, h
+        except Exception:
+            pass
+    try:
+        w, h = window.get_size()
+        return int(w), int(h)
+    except Exception:
+        return 0, 0
+
+
+def _resize_window(window, w, h):
+    """Resize the window to w×h logical px (R24, §12.7, §13.2).
+
+    Portable chain:
+    - resize(w, h) where the binding exposes it (GTK < 4.14 — the
+      mapped-window resize API, deprecated and hidden in 4.14).
+    - Before presentation: set_default_size(w, h) — the initial size.
+    - After mapping (verified: set_default_size is a no-op on a mapped
+      window on this binding / Wayland): set_size_request(w, h) forces
+      the window *up* to the target (a size request is a minimum),
+      then a short GLib timer releases the clamp (set_size_request(-1,
+      -1)) once the size reaches the target or a 2 s deadline passes,
+      so the window stays freely user-resizable afterwards. A target at
+      or below the current size (within RESIZE_TOL) is a compositor
+      decision on Wayland (the client resize API was deprecated in GTK
+      4.14) and is left alone. A grow is issued only when the current
+      size is *verified* smaller: any min-size change — including the
+      later release — can make COSMIC re-apply the window's remembered
+      size (§13.2), so a blind grow on an unverifiable (0×0) size is
+      skipped.
+    """
+    resize = getattr(window, "resize", None)
+    if callable(resize):
+        try:
+            resize(w, h)
+            return
+        except Exception:
+            pass
+    try:
+        mapped = bool(window.get_mapped())
+    except Exception:
+        mapped = True
+    if not mapped:
+        _dbg(f"resize {w}x{h}: unmapped -> set_default_size")
+        try:
+            window.set_default_size(w, h)
+        except Exception:
+            pass
+        return
+    cur_w, cur_h = _window_size(window)
+    if cur_w <= 0 or cur_h <= 0:
+        # Current size unverifiable (observed: gtk_window_get_size →
+        # 0×0 on a mapped window on Wayland/COSMIC). Skip: issuing a
+        # min-size request that must be released later would itself
+        # trigger the compositor's window-size memory (§13.2) — and the
+        # window is usually already at the fitted size (early fit).
+        _dbg(f"resize {w}x{h}: current size unknown (0x0); skipping grow")
+        return
+    # A fitted target within RESIZE_TOL of the current size is treated as
+    # already achieved: no resize request at all (a min-size change —
+    # even a no-op grow that is released again — can make COSMIC
+    # re-apply the window's remembered size, §13.2).
+    if w <= cur_w + RESIZE_TOL and h <= cur_h + RESIZE_TOL:
+        _dbg(f"resize {w}x{h}: within tolerance of {cur_w}x{cur_h}; no-op")
+        return
+    _dbg(f"resize {w}x{h}: grow from {cur_w}x{cur_h} via size_request")
+    try:
+        window.set_size_request(w, h)
+    except Exception:
+        return
+    import gi
+    gi.require_version("GLib", "2.0")
+    from gi.repository import GLib
+    start = time.monotonic()
+
+    # NOARGUMENTS: PyGObject calls GLib.timeout_add callbacks with no
+    # arguments (the C g_source_func signature does not apply to Python).
+    # A TypeError here would leave the size-request clamp in place
+    # forever — the window permanently unshrinkable (§13.2).
+    def _release():
+        try:
+            reached = _window_size(window) == (w, h)
+        except Exception:
+            reached = False
+        if not (reached or time.monotonic() - start > 2.0):
+            return True
+        _dbg(f"clamp released ({'reached' if reached else 'deadline'})")
+        try:
+            window.set_size_request(-1, -1)
+        except Exception:
+            pass
+        # If the grow was actually reached, do one late check: the
+        # compositor may resize the window again after the min-size is
+        # released (the COSMIC clamping bug — D15). Log it so the behavior
+        # is explainable.
+        if reached:
+            def _late_check():
+                try:
+                    final = _window_size(window)
+                except Exception:
+                    return False
+                if final != (w, h):
+                    _dbg(f"note: the compositor resized the window to "
+                         f"{final[0]}x{final[1]} after the fit to {w}x{h} "
+                         f"(COSMIC clamping bug, D15 — see spec §13.2)")
+                return False
+            GLib.timeout_add(400, _late_check)
+        return False
+
+    GLib.timeout_add(50, _release)
+
+
 # ---------------------------------------------------------------------------
 # Launch context & target resolution (rev 0.8; R20–R22, §4.6)
 # ---------------------------------------------------------------------------
@@ -292,8 +769,8 @@ def resolve_target(raw_target, gui_context):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="riview",
-        description="Reloading Image Viewer — watch a directory and always "
-                    "display its newest image.",
+        description="Reloading Image Viewer — watch a directory and display "
+                    "its newest image.",
     )
     p.add_argument("target", nargs="?", default=None,
                    help="directory or image file to watch (default: the "
@@ -303,12 +780,36 @@ def build_parser():
                    help="comma-separated candidate extensions (default: %(default)s)")
     p.add_argument("--stable-ms", type=int, default=DEFAULT_STABLE_MS, metavar="MS",
                    help="settle window in milliseconds; 0 disables (default: %(default)s)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--cycle", action="store_true",
+                   help="start in cycle mode (the slide show) at launch — "
+                        "first slide the oldest settled image (R29); an "
+                        "optional SECONDS value directly after the flag "
+                        f"sets the initial cycle time (default: {DEFAULT_CYCLE_S}"
+                        " s); mutually exclusive with --cycle-time")
+    g.add_argument("--cycle-time", type=int, default=None, metavar="SECONDS",
+                   help="cycle time for cycle mode (R27/R28) in integer "
+                        f"seconds; minimum 1 (default: {DEFAULT_CYCLE_S}); "
+                        "Up/Down adjust it at runtime; mutually exclusive "
+                        "with --cycle")
+    p.add_argument("--cycle-value", type=int, default=None,
+                   metavar="SECONDS", help=argparse.SUPPRESS)
+    # (the plumbing for `--cycle SECONDS` — see _cycle_argv)
     p.add_argument("--poll", type=float, default=None, metavar="SECONDS",
                    help="poll every SECONDS instead of using inotify (also the "
                         "fallback interval when given)")
     p.add_argument("--max-dim", type=int, default=0, metavar="PX",
                    help="cap on the longer side of the decoded image, in pixels; "
                         "0 = no cap (default: %(default)s)")
+    p.add_argument("--fit", "--fit-window", dest="fit",
+                   choices=("ratio", "exact", "off"), default="ratio",
+                   help="window fit mode (R24): how the window is sized to "
+                        "the first displayed image — ratio: the image's "
+                        "aspect ratio within the smaller of the 80%% budget "
+                        "and the 1600x1200 COSMIC cap (default; D15); "
+                        "exact: 1:1 logical pixels, capped at the screen "
+                        "minus the header; off: the pre-image size only. "
+                        "r re-fits on demand (any mode except off).")
     p.add_argument("--fullscreen", action="store_true",
                    help="start in full screen")
     p.add_argument("--print", action="store_true",
@@ -325,6 +826,27 @@ def build_parser():
     return p
 
 
+def _cycle_argv(argv):
+    """`--cycle SECONDS` plumbing (R29): argparse cannot distinguish the
+    optional seconds value from the positional target (a `nargs='?'`
+    flag would swallow `riview --cycle <dir>`), so the explicit form is
+    rewritten to the hidden --cycle-value before parsing. Only a token
+    that looks like a number is taken as the value (a directory called
+    `5` must still be addressable as `riview 5 --cycle`)."""
+    out = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if (a == "--cycle" and i + 1 < len(argv)
+                and re.fullmatch(r"-?\d+(\.\d+)?", argv[i + 1])):
+            out.extend(["--cycle", "--cycle-value", argv[i + 1]])
+            i += 2
+        else:
+            out.append(a)
+            i += 1
+    return out
+
+
 def validate(args):
     """Apply §4.2 option validation; raises UsageError (exit 2).
 
@@ -337,6 +859,23 @@ def validate(args):
         raise UsageError(f"--poll must be > 0 (got {args.poll})")
     if args.max_dim < 0:
         raise UsageError(f"--max-dim must be >= 0 (got {args.max_dim})")
+    # Cycle time (R28, §4.2): `--cycle [SECONDS]` (the value is plumbed
+    # through the hidden --cycle-value, _cycle_argv) sets the initial
+    # cycle time; --cycle and --cycle-time are mutually exclusive.
+    if args.cycle_value is not None and args.cycle_time is not None:
+        raise UsageError("--cycle's SECONDS value and --cycle-time are "
+                         "mutually exclusive")
+    if args.cycle_value is not None and args.cycle_value < 1:
+        raise UsageError(f"--cycle must be >= 1 second "
+                         f"(got {args.cycle_value})")
+    if args.cycle_time is not None:
+        if args.cycle_time < 1:
+            raise UsageError(f"--cycle-time must be >= 1 "
+                             f"(got {args.cycle_time})")
+    elif args.cycle_value is not None:
+        args.cycle_time = args.cycle_value
+    else:
+        args.cycle_time = DEFAULT_CYCLE_S
     if args.print and args.fullscreen:
         raise UsageError("--print is incompatible with --fullscreen")
     args.exts = parse_extensions(args.extensions)
@@ -632,7 +1171,31 @@ def _gui_classes():
             self.snapshot = None
             self.failed_versions = set()
             self.current_gen = 0
+            # Manual navigation (R23, §5.5): pinned_path is the chosen file
+            # in manual mode (None = live mode); image_gone is the display
+            # state while the pinned file is not a candidate.
+            self.pinned_path = None
+            self.image_gone = False
+            # Window fit (R24, §5.6): the fit mode from --fit, and whether
+            # the once-only fit pass has run.
+            self.fit_mode = args.fit
+            self.fitted = False
             self._last_canvas_click_s = -1.0
+            # Cycle mode / slide show (rev 1.6, R27–R29, §5.7): the cycle
+            # time (validated, §4.2), the mode flag, the --cycle start
+            # (first slide = oldest settled), and the in-progress-interval
+            # bookkeeping (R28 rescale: elapsed time is preserved).
+            self.cycle_s = args.cycle_time
+            self.cycle_mode = False
+            self.start_oldest = False
+            self.cycle_deadline = None
+            self.cycle_interval_start = None
+            self._cycle_tick_id = None
+            self._cycle_first_req = None
+            self._dims = None  # last displayed image's decoded dimensions
+            # Full-screen keypress feedback (rev 1.7, R30): the pending
+            # 1 s hide timeout (None when no overlay is up).
+            self._feedback_id = None
 
             # Window icon: the desktop icon when installed (R20), else a
             # generic fallback so the decoration still reads "image".
@@ -645,7 +1208,10 @@ def _gui_classes():
             css = Gtk.CssProvider()
             css.load_from_string(
                 "window { background-color: #000000; }\n"
-                ".riview-waiting { color: #ffffff; }")
+                ".riview-waiting { color: #ffffff; }\n"
+                ".riview-feedback { color: #ffffb5; font-size: 2.5em; "
+                "background-color: rgba(70, 70, 70, 0.65); "
+                "padding: 10px 18px; border-radius: 8px; }")
             Gtk.StyleContext.add_provider_for_display(
                 Gdk.Display.get_default(),
                 css,
@@ -690,6 +1256,21 @@ def _gui_classes():
             overlay.set_child(self.picture)
             overlay.add_overlay(wrap)
 
+            # -- full-screen keypress feedback overlay (R30, §5.8) ---------
+            # Bottom center of the canvas: its bottom edge sits 10% up
+            # from the window bottom (the margin is set from the current
+            # allocated height at show time, _show_feedback — GTK4 has no
+            # window size-changed signal, and a 1 s transient does not
+            # need live resize tracking); 2.5 em pale-yellow text on a
+            # semi-transparent gray shade (§12.7); hidden by default;
+            # shown for 1 s by _show_feedback.
+            self._feedback_label = Gtk.Label()
+            self._feedback_label.add_css_class("riview-feedback")
+            self._feedback_label.set_halign(Gtk.Align.CENTER)
+            self._feedback_label.set_valign(Gtk.Align.END)
+            self._feedback_label.set_visible(False)
+            overlay.add_overlay(self._feedback_label)
+
             # -- canvas double-click: toggle full screen (R19) --------------
             # Button 1, two presses within DOUBLE_CLICK_S. The overlay covers
             # picture + letterbox + waiting label (header bar excluded). The
@@ -713,6 +1294,28 @@ def _gui_classes():
             self._init_w, self._init_h = init_w, init_h
             self.set_default_size(init_w, init_h)
 
+            # -- debug size watch (RIVIEW_DEBUG, §13.2) ---------------------
+            # Logs every window size change with a timestamp. The fit pass
+            # is a no-op when the early fit already sized the window, so any
+            # change after presentation is NOT caused by riview's resize
+            # code — this isolates compositor-side resize interference.
+            if os.environ.get("RIVIEW_DEBUG", "") not in ("", "0"):
+                self._t0 = time.monotonic()
+                self._last_sz = None
+
+                def _sz_watch():
+                    try:
+                        sz = (self.get_width(), self.get_height())
+                    except Exception:
+                        sz = None
+                    if (sz is not None and sz != (0, 0)
+                            and sz != self._last_sz):
+                        _dbg(f"SIZE t+{time.monotonic() - self._t0:7.2f}s: "
+                             f"{self._last_sz} -> {sz}")
+                        self._last_sz = sz
+                    return True
+                GLib.timeout_add(100, _sz_watch)
+
             # -- keyboard shortcuts (R18, design §12.9) --------------------
             # Installed before the services so the idle state also has
             # q/f/Esc (R22).
@@ -735,18 +1338,151 @@ def _gui_classes():
             self.watcher = Watcher(self.dir_abs, args.poll, self.on_rescan)
             self.watcher.start()
             self._pump_id = GLib.timeout_add(PUMP_MS, self._pump)
+            # --cycle at startup (R29): cycle mode armed before any
+            # display; the first displayed image is the OLDEST settled
+            # candidate, and its interval starts at the display. Inert in
+            # single-file mode (R21) — no cycle for one image.
+            if args.cycle and self.mode == "dir":
+                self.start_oldest = True
+                self._cycle_start()
 
-        def _init_size(self):
-            # 80% of the primary monitor work area, min 900x675 (D11).
+        def _monitor(self):
+            """The monitor the window is on (R24, §12.7), or None.
+
+            Portable chain: the window's current monitor → the primary
+            (where the binding exposes it) → the first monitor. This
+            system's PyGObject exposes neither get_primary_monitor() nor
+            get_monitor(n) (§13.2), so both are getattr-guarded.
+            """
             try:
                 display = Gdk.Display.get_default()
-                mon = display.get_primary_monitor() or display.get_monitor(0)
-                sf = mon.get_scale_factor() or 1
-                w = max(int(mon.get_width() / sf * 0.8), 900)
-                h = max(int(mon.get_height() / sf * 0.8), 675)
-                return w, h
+            except Exception:
+                return None
+            if display is None:
+                return None
+            mon = None
+            try:
+                mon = display.get_monitor_at_surface(self)
+            except Exception:
+                pass
+            if mon is None:
+                gpm = getattr(display, "get_primary_monitor", None)
+                if callable(gpm):
+                    try:
+                        mon = gpm()
+                    except Exception:
+                        mon = None
+            if mon is None:
+                try:
+                    mons = display.get_monitors()
+                    if mons:
+                        mon = mons[0]
+                except Exception:
+                    mon = None
+            return mon
+
+        def _initial_candidate(self):
+            """File the startup rescan will display first (R24 early
+            fit, §5.6), or None: the newest file already settled now,
+            or the target file itself in single-file mode. A still-
+            settling file is not used — the fit pass on first
+            displayed load covers it."""
+            try:
+                now_mono, now_wall = time.monotonic(), time.time()
+                if self.mode == "file":
+                    return self.only_path if os.path.isfile(self.only_path) \
+                        else None
+                cands = scan_candidates(self.dir_abs, self.exts)
+                update_observed(self.observer, cands, now_mono, now_wall)
+                settled = [c for c in cands
+                           if is_settled(self.observer.get(c[0]), now_mono,
+                                         now_wall, self.window_s)]
+                args = getattr(self, "args", None)
+                if (args is not None and args.cycle and settled):
+                    # --cycle (R29): the first displayed image is the
+                    # OLDEST settled candidate — size the window for it
+                    # (the fit pass on first displayed load re-measures).
+                    return order_cands(settled)[-1][0]
+                return pick_best(settled, None)
+            except Exception:
+                return None
+
+        def _init_size(self):
+            """Initial window size (D11 pre-image default; R24 early
+            fit).
+
+            Pre-image default: 80% of the monitor, min 900×675. Early
+            fit: when the fit mode is not off and a candidate is
+            already settled at construction, the window opens *directly*
+            at the fit size — set_default_size before presentation is
+            the only reliable client-side window sizing on GTK >= 4.14
+            bindings (§13.2); the post-map fit pass on first displayed
+            load remains as the safety net (it also covers still-
+            settling files, and the 47 px header estimate used here vs.
+            the allocated height used there). Exception: 1280×960.
+            """
+            try:
+                box = self._monitor_box()
+                if box is None:
+                    raise LookupError("no monitor")
+                box_w, box_h, sw, sh, header_h, sf = box
+                if (self.fit_mode != "off" and self.mode != "none"
+                        and not self.fullscreen_mode):
+                    cand = self._initial_candidate()
+                    dims = probe_dimensions_file(cand) \
+                        if cand is not None else None
+                    if dims is not None:
+                        size = fit_window(self.fit_mode, dims[0], dims[1],
+                                          box_w, box_h, sw, sh, header_h,
+                                          sf)
+                        if size is not None:
+                            _dbg(f"early fit: dims={dims} -> {size}")
+                            return size
+                return box_w, box_h
             except Exception:
                 return 1280, 960
+
+        def _monitor_box(self):
+            """Fit geometry inputs (R24, §12.7), or None.
+
+            Returns (box_w, box_h, screen_w, screen_h, header_h, sf): the
+            80% pre-image budget box (D11 semantics, min 900x675), the full
+            monitor in logical pixels, the header height, and the window's
+            own scale factor (the current monitor's in mixed-DPI). The
+            monitor is the one the window is currently on.
+            """
+            mon = self._monitor()
+            if mon is None:
+                return None
+            screen = _monitor_logical_size(mon)
+            if screen is None:
+                return None
+            screen_w, screen_h = screen
+            if screen_w <= 0 or screen_h <= 0:
+                return None
+            box_w = max(int(screen_w * 0.8), 900)
+            box_h = max(int(screen_h * 0.8), 675)
+            header_h = 0
+            if self.header is not None:
+                # get_height() (GTK >= 4.10). The deprecated
+                # get_allocated_height() is only called when get_height is
+                # missing (older binding) — calling it here even to probe a
+                # zero allocation emits a DeprecationWarning (§13.2).
+                get_h = getattr(self.header, "get_height", None)
+                if callable(get_h):
+                    try:
+                        header_h = get_h()
+                    except Exception:
+                        header_h = 0
+                else:
+                    try:
+                        header_h = self.header.get_allocated_height()
+                    except Exception:
+                        header_h = 0
+            if not header_h:  # not allocated yet (or no header): fallback
+                header_h = 47
+            sf = self.get_scale_factor() or 1
+            return box_w, box_h, screen_w, screen_h, header_h, sf
 
         def decode_target(self):
             # 2x scale_factor x window, capped by --max-dim on the longer side.
@@ -771,6 +1507,12 @@ def _gui_classes():
             now_mono = time.monotonic()
             now_wall = time.time()
             update_observed(self.observer, cands, now_mono, now_wall)
+            if self.cycle_mode:  # slide show (R27, §5.7): hold the display
+                self._rescan_cycle(cands, now_mono, now_wall)
+                return
+            if self.pinned_path is not None:  # manual mode (R23, §5.5)
+                self._rescan_pinned(cands, now_mono, now_wall)
+                return
             settled = [c for c in cands
                        if is_settled(self.observer[c[0]], now_mono, now_wall,
                                      self.window_s)]
@@ -787,10 +1529,269 @@ def _gui_classes():
             self.current_gen += 1
             self.decoder.request(self.current_gen, best, *self.decode_target())
 
-        # -- display state (spec §5.4, R8, R10) --------------------------------
+        def _rescan_pinned(self, cands, now_mono, now_wall):
+            """Manual-mode rescan (R23, §5.5): the display is pinned to
+            self.pinned_path; live following (R1/R3) is suspended."""
+            pinned = self.pinned_path
+            if pinned not in [c[0] for c in cands]:
+                # Pin lost → image-gone state. The pin PERSISTS: the file
+                # reappearing (and settling) restores the display, and `n`
+                # exits the state.
+                if not self.image_gone:
+                    self.show_image_gone()
+                return
+            obs = self.observer[pinned]
+            if (self.snapshot is not None and pinned == self.snapshot.path
+                    and obs.mtime_ns == self.snapshot.mtime_ns
+                    and obs.size == self.snapshot.size):
+                return  # already showing this exact pinned version
+            if not is_settled(obs, now_mono, now_wall, self.window_s):
+                # A new version is still settling (or the just-reappeared
+                # file): hold the current display / message (R4/R6).
+                return
+            # In-place update settled (R4) — or the pin reappeared after
+            # being gone (no snapshot / different path): (re)display it.
+            self.current_gen += 1
+            self.decoder.request(self.current_gen, pinned, *self.decode_target())
+
+        # -- cycle mode (rev 1.6, R27–R29, §5.7) --------------------------------
+        def _rescan_cycle(self, cands, now_mono, now_wall):
+            """Cycle-mode rescan (R27, §5.7): the display holds like a pin
+            on the displayed path — live following (R3) is suspended; an
+            in-place update of the shown slide reloads once settled (R4);
+            a deleted shown slide holds the last decoded frame (no
+            image-gone state while cycling). The first display (armed
+            `c` / `--cycle`, snapshot None) selects the first slide and
+            starts the in-progress interval at the display."""
+            settled = [c for c in cands
+                       if is_settled(self.observer[c[0]], now_mono, now_wall,
+                                     self.window_s)]
+            ordered = order_cands(settled)
+            if not ordered:
+                if self.snapshot is None and not self.image_gone:
+                    self.show_waiting(None)
+                return
+            if self.snapshot is not None:
+                path = self.snapshot.path
+                if path not in [c[0] for c in cands]:
+                    return  # slide deleted: hold the last decoded frame
+                obs = self.observer[path]
+                if (obs.mtime_ns, obs.size) == (self.snapshot.mtime_ns,
+                                                self.snapshot.size):
+                    return
+                if not is_settled(obs, now_mono, now_wall, self.window_s):
+                    return  # new version still settling: hold (R4)
+                self._cycle_request(path)  # in-place update settled (R4)
+                return
+            # No display yet: first slide (armed `c` / --cycle, R27/R29)
+            if self._cycle_first_req is not None:
+                return  # first display in flight: keep the interval
+            target = cycle_first(ordered, self.start_oldest,
+                                 self.failed_versions)
+            if target is None:
+                self.show_waiting(None)  # every candidate failed (R15)
+                return
+            self.start_oldest = False
+            obs = self.observer.get(target)
+            self._cycle_first_req = (target,
+                                     obs.mtime_ns if obs else -1,
+                                     obs.size if obs else -1)
+            now = time.monotonic()
+            self.cycle_interval_start = now
+            self.cycle_deadline = now + self.cycle_s
+            self._cycle_request(target)
+
+        def _show_feedback(self, text):
+            """R30 (§5.8): the 1 s on-canvas overlay — full screen only
+            (windowed mode keeps the header as the feedback channel), purely
+            cosmetic (it touches no cycle, selection, decode, or sizing
+            state). A further feedback keypress replaces the text and
+            restarts the timer (last wins); a None text (no-op keypress)
+            leaves the label and any running timer untouched. The bottom
+            edge is placed 10% up from the window bottom using the current
+            allocated height (no resize signal is tracked — §12.7)."""
+            if not self.fullscreen_mode or text is None:
+                return
+            self._feedback_label.set_margin_bottom(
+                int(self.get_height() * FEEDBACK_BOTTOM_FRAC))
+            self._feedback_label.set_text(text)
+            self._feedback_label.set_visible(True)
+            if self._feedback_id is not None:
+                GLib.source_remove(self._feedback_id)
+                self._feedback_id = None
+            self._feedback_id = GLib.timeout_add(FEEDBACK_MS,
+                                                 self._feedback_hide)
+
+        def _feedback_hide(self):
+            """R30: drop the overlay (the 1 s timer's callback, and the
+            immediate dismissal on a full-screen toggle / shutdown).
+            No-argument — the GLib timeout contract (§13.2)."""
+            if self._feedback_id is not None:
+                GLib.source_remove(self._feedback_id)
+                self._feedback_id = None
+            self._feedback_label.set_visible(False)
+
+        def _cycle_start(self):
+            """c (R27) / --cycle (R29): enter cycle mode.
+
+            No-op while already cycling and in single-file mode / the idle
+            state. The pin is dropped (the cycle is not a pin — it
+            advances); the first advance is a full cycle time away, and
+            with an empty display the interval is (re)started at the
+            first display (§5.7). No effect in the idle state (no
+            directory) and single-file mode (R21). Returns whether the
+            cycle actually started (R30 feedback).
+            """
+            if (self.cycle_mode or self.mode != "dir"
+                    or self.decoder is None):
+                return False
+            self.pinned_path = None
+            self.cycle_mode = True
+            if self.snapshot is None:  # waiting / image-gone: waiting state
+                self.show_waiting(None)
+            now = time.monotonic()
+            self.cycle_interval_start = now
+            self.cycle_deadline = now + self.cycle_s
+            if self._cycle_tick_id is None:
+                self._cycle_tick_id = GLib.timeout_add(CYCLE_CHECK_MS,
+                                                       self._cycle_tick)
+            self._update_cycle_indicator()
+            return True
+
+        def _cycle_stop(self):
+            """Exit cycle mode (R27): disarm the deadline check, clear the
+            state, refresh the indicator. Every mode-selecting key stops
+            the cycle first, then applies its normal semantics; also on
+            shutdown."""
+            if not self.cycle_mode:
+                return
+            self.cycle_mode = False
+            self.start_oldest = False
+            self.cycle_deadline = None
+            self.cycle_interval_start = None
+            self._cycle_first_req = None
+            if self._cycle_tick_id is not None:
+                GLib.source_remove(self._cycle_tick_id)
+                self._cycle_tick_id = None
+            self._update_cycle_indicator()
+
+        def _cycle_request(self, path):
+            """One cycle decode (R27): an ordinary dual-buffered request
+            unless the displayed snapshot already is this exact version
+            (the single-settled-image case: the cycle holds)."""
+            obs = self.observer.get(path)
+            if (self.snapshot is not None and path == self.snapshot.path
+                    and obs is not None
+                    and obs.mtime_ns == self.snapshot.mtime_ns
+                    and obs.size == self.snapshot.size):
+                return
+            self.current_gen += 1
+            self.decoder.request(self.current_gen, path, *self.decode_target())
+
+        def _cycle_tick(self):
+            """Cycle deadline check (R27/R28, §12.5): the CYCLE_CHECK_MS
+            main-thread timeout. When the deadline has passed, scan, pick
+            the advance target (first slide when no display is up; else
+            the adjacent newer settled candidate, wrapping to the oldest,
+            skipping failed versions), and issue one decode request.
+            Fixed-period deadline: each advance reschedules at
+            now + cycle_s; new-image arrivals and decode failures do not
+            reset the clock."""
+            if not self.cycle_mode:
+                self._cycle_tick_id = None
+                return False
+            now = time.monotonic()
+            if self.cycle_deadline is not None and now < self.cycle_deadline:
+                return True
+            cands = scan_candidates(self.dir_abs, self.exts)
+            now_wall = time.time()
+            update_observed(self.observer, cands, now, now_wall)
+            settled = [c for c in cands
+                       if is_settled(self.observer[c[0]], now, now_wall,
+                                     self.window_s)]
+            ordered = order_cands(settled)
+            if not ordered:
+                if self.snapshot is None and not self.image_gone:
+                    self.show_waiting(None)
+                self.cycle_deadline = now + self.cycle_s
+                return True
+            if self.snapshot is None:
+                # No display yet (armed `c` / --cycle, or resuming after
+                # the list went empty, R27/R29): the first slide; the
+                # interval starts at this display.
+                if self._cycle_first_req is not None:
+                    return True  # in flight; the deadline backstops it
+                target = cycle_first(ordered, self.start_oldest,
+                                     self.failed_versions)
+                if target is None:
+                    self.show_waiting(None)  # every candidate failed (R15)
+                    self.cycle_deadline = now + self.cycle_s
+                    return True
+                self.start_oldest = False
+                obs = self.observer.get(target)
+                self._cycle_first_req = (target,
+                                         obs.mtime_ns if obs else -1,
+                                         obs.size if obs else -1)
+                self.cycle_interval_start = now
+                self.cycle_deadline = now + self.cycle_s
+            else:
+                anchor = nav_anchor(ordered, self.snapshot.path,
+                                    self.snapshot)
+                target = cycle_target(ordered, anchor, self.failed_versions)
+                self.cycle_interval_start = now
+                self.cycle_deadline = now + self.cycle_s
+            if target is not None:
+                self._cycle_request(target)
+            return True
+
+        def _cycle_adjust(self, delta):
+            """Up/Down: ±1 s on the cycle time (R28). Works during and
+            outside cycle mode; while cycling the CURRENT interval is
+            rescaled — the elapsed time is preserved (remaining = new
+            time − elapsed; a new time below the elapsed advances at the
+            next tick) — and every following interval is the new full
+            cycle time. The 1 s floor makes Down a no-op (the deadline
+            is untouched). Returns whether the cycle time changed (R30
+            feedback)."""
+            interval_start = self.cycle_interval_start or time.monotonic()
+            new, remaining = cycle_rescale(self.cycle_s,
+                                           time.monotonic() - interval_start,
+                                           delta)
+            if remaining is None:
+                return False  # floor: no effect
+            self.cycle_s = new
+            if self.cycle_mode:
+                self.cycle_deadline = time.monotonic() + remaining
+            self._update_cycle_indicator()
+            return True
+
+        def _cycle_suffix(self):
+            """The `· cycle Ns` subtitle part (R28) — '' outside cycle
+            mode; the whole header is hidden in --fullscreen (R16)."""
+            if self.cycle_mode:
+                return f" · cycle {self.cycle_s}s"
+            return ""
+
+        def _update_cycle_indicator(self):
+            """Refresh the header subtitle with the cycle indicator
+            (R28): the current subtitle's base + the suffix (hidden in
+            --fullscreen, R16)."""
+            if self.fullscreen_mode:
+                return
+            if self.snapshot is not None and self._dims is not None:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S",
+                                   time.localtime(self.snapshot.mtime_ns
+                                                  / 1e9))
+                base = (f"{self._dims[0]}×{self._dims[1]}  ·  {ts}")
+            else:
+                base = self._subtitle
+            self.title_widget.set_subtitle(base + self._cycle_suffix())
+
+        # -- display state (spec §5.4, R8, R10, R23) ----------------------------
         def show_waiting(self, error_path):
             self.picture.set_paintable(None)
             self.snapshot = None
+            self.image_gone = False
             if error_path:
                 self.waiting_label.set_text(
                     f"Could not load {os.path.basename(error_path)} — see stderr")
@@ -801,7 +1802,23 @@ def _gui_classes():
                 self.waiting_label.set_text("Waiting for images…")
             self.waiting_label.set_visible(not self.fullscreen_mode)  # R16
             self.title_widget.set_title("riview")
-            self.title_widget.set_subtitle(self._subtitle)
+            self.title_widget.set_subtitle(self._subtitle
+                                           + self._cycle_suffix())
+            self.set_title("riview")
+
+        def show_image_gone(self):
+            """R23/§5.5: the pinned file ceased to be a candidate — black
+            canvas + explanatory message (hidden in --fullscreen, R16).
+            The pin persists; the display is restored when the file
+            reappears and settles, or on `n`."""
+            self.picture.set_paintable(None)
+            self.snapshot = None
+            self.image_gone = True
+            self.waiting_label.set_text(IMAGE_GONE_TEXT)
+            self.waiting_label.set_visible(not self.fullscreen_mode)  # R16
+            self.title_widget.set_title("riview")
+            self.title_widget.set_subtitle(self._subtitle
+                                           + self._cycle_suffix())
             self.set_title("riview")
 
         def _pump(self):
@@ -815,20 +1832,46 @@ def _gui_classes():
             return True
 
         def _on_load_ok(self, path, pixbuf):
+            # R24 fit pass — once, on the first displayed load, before the
+            # swap so size + image land together (§12.7). Skipped in
+            # --fullscreen and "off" mode; latched when it first applies
+            # (a later --fullscreen exit re-arms it via the next load).
+            if (not self.fitted and self.fit_mode != "off"
+                    and not self.fullscreen_mode):
+                box = self._monitor_box()
+                if box is not None:
+                    # The fit is measured on the image's ORIGINAL pixel
+                    # dimensions (1:1 semantics for "exact"), probed from
+                    # the header; the displayed pixbuf is a scaled copy
+                    # (decode target = 2× scale factor × window).
+                    dims = probe_dimensions_file(path)
+                    if dims is None:
+                        dims = (pixbuf.get_width(), pixbuf.get_height())
+                    size = fit_window(self.fit_mode, dims[0], dims[1], *box)
+                    _dbg(f"fit pass: dims={dims} box={box} -> {size}")
+                    if size is not None:
+                        _resize_window(self, *size)
+                self.fitted = True
             obs = self.observer.get(path)
             mtime = obs.mtime_ns if obs else 0
             size = obs.size if obs else 0
             self.snapshot = Snapshot(path, mtime, size,
                                      pixbuf.get_width(), pixbuf.get_height())
+            self.image_gone = False
+            _dbg(f"image displayed: {os.path.basename(path)} "
+                 f"{pixbuf.get_width()}x{pixbuf.get_height()}")
             # set_paintable + texture: the non-deprecated display API
             # (set_pixbuf is deprecated in GTK >= 4.10; a Pixbuf itself is
             # not a Gdk.Paintable, so wrap it in a texture — §13.2).
             self.picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
             self.waiting_label.set_visible(False)
+            self._cycle_first_req = None
+            self._dims = (pixbuf.get_width(), pixbuf.get_height())
             self.title_widget.set_title(os.path.basename(path))
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime / 1e9))
             self.title_widget.set_subtitle(
-                f"{pixbuf.get_width()}×{pixbuf.get_height()}  ·  {ts}")
+                f"{pixbuf.get_width()}×{pixbuf.get_height()}  ·  {ts}"
+                + self._cycle_suffix())
             self.set_title(os.path.basename(path))
 
         def _on_load_error(self, path, error):
@@ -839,16 +1882,30 @@ def _gui_classes():
                 print(f"riview: warning: could not load {path}: {error}",
                       file=sys.stderr)
             if self.snapshot is None:
+                self._cycle_first_req = None  # first slide failed: the next
+                # advance reselects (failed versions are skipped, R15)
                 self.show_waiting(path)
             # else: dual buffer — the current image stays (R7)
 
-        # -- keyboard shortcuts (R18, design §12.9) ------------------------
+        # -- keyboard shortcuts (R18, R23, design §12.9) -----------------
         def _on_key(self, controller, keyval, keycode, state):
-            """q = quit; f = toggle full screen; Esc = leave full screen.
+            """q = quit; f = toggle full screen; Esc = leave full screen;
+            Left/Right = manual navigation; n = back to the newest (R23);
+            Home/End = jump to the oldest/newest, pinned (R25);
+            p = pause — pin the displayed image (R26);
+            r = re-fit the window to the displayed image (R24);
+            c = start cycle mode, the slide show (R27);
+            Up/Down = ±1 s on the cycle time (R28).
+            In full screen (R16), the effective c/p/n/Up/Down keypresses
+            show a 1 s on-canvas overlay — the header is the feedback
+            channel in windowed mode (R30, §5.8).
 
             Bare keys only: any modifier beyond Shift/locks leaves the event
             unhandled (Ctrl+q etc. are not shortcuts, §11 case 23). Works in
-            windowed and full-screen mode alike.
+            windowed and full-screen mode alike. In cycle mode (R27), every
+            mode-selecting key — Left/Right/Home/End/p/n — stops the cycle
+            first, then applies its normal semantics; f/Esc/r/double-click
+            do not affect it; Up/Down adjust the cycle time.
             """
             if int(state) & ~self._PERMITTED_MODS:
                 return False
@@ -861,14 +1918,215 @@ def _gui_classes():
             if keyval == Gdk.KEY_Escape and self.fullscreen_mode:
                 self._set_fullscreen(False)
                 return True
+            if keyval == Gdk.KEY_Left:
+                self._cycle_stop()  # cycle mode: exit first (R27)
+                self._nav(-1)
+                return True
+            if keyval == Gdk.KEY_Right:
+                self._cycle_stop()  # cycle mode: exit first (R27)
+                self._nav(+1)
+                return True
+            if keyval in (Gdk.KEY_n, Gdk.KEY_N):
+                was_cycling = self.cycle_mode
+                self._cycle_stop()  # cycle mode: exit first (R27)
+                if was_cycling:
+                    # Live mode resumes (R3): select the newest now.
+                    if self.watcher is not None:
+                        self.watcher.schedule_rescan(0)
+                    effective = True
+                else:
+                    effective = self._back_to_newest()
+                self._show_feedback(
+                    feedback_message("n", effective, self.cycle_s))  # R30
+                return True
+            if keyval == Gdk.KEY_Home:
+                self._cycle_stop()  # cycle mode: exit first (R27)
+                self._jump("oldest")
+                return True
+            if keyval == Gdk.KEY_End:
+                self._cycle_stop()  # cycle mode: exit first (R27)
+                self._jump("newest")
+                return True
+            if keyval in (Gdk.KEY_p, Gdk.KEY_P):
+                self._cycle_stop()  # cycle mode: stop and pin (R26)
+                engaged = self._pause()
+                self._show_feedback(
+                    feedback_message("p", engaged, self.cycle_s))  # R30
+                return True
+            if keyval in (Gdk.KEY_r, Gdk.KEY_R):
+                self._refit()  # display key: cycle mode keeps running
+                return True
+            if keyval in (Gdk.KEY_c, Gdk.KEY_C):
+                started = self._cycle_start()  # no-op while already cycling
+                self._show_feedback(
+                    feedback_message("c", started, self.cycle_s))  # R30
+                return True
+            if keyval == Gdk.KEY_Up:
+                changed = self._cycle_adjust(+1)  # R28: in/out of cycle mode
+                self._show_feedback(
+                    feedback_message("up", changed, self.cycle_s))  # R30
+                return True
+            if keyval == Gdk.KEY_Down:
+                changed = self._cycle_adjust(-1)  # R28: 1 s floor
+                self._show_feedback(
+                    feedback_message("down", changed, self.cycle_s))  # R30
+                return True
             return False
+
+        def _nav(self, direction):
+            """Left/Right: two-phase movement (rev 1.5, R23, §5.5).
+
+            Attempt: one step toward the older (direction -1) / newer
+            (+1) end from the anchor — where the displayed version sorts
+            in the current navigation list by (mtime, path); when the
+            displayed file is not a settled candidate (image-gone state,
+            rewrite in flight) the anchor is its last known (mtime, path).
+            Pin: whatever is displayed is pinned — a failed attempt
+            therefore freezes the live display (exiting live mode), and
+            in manual mode the pin is simply unchanged. A decode request
+            is issued only when the attempt resolves to a different
+            candidate. No effect in single-file mode (R21) and the idle
+            state (R22); in the waiting state there is nothing to pin.
+            """
+            if self.mode != "dir" or self.decoder is None:
+                return
+            cands = scan_candidates(self.dir_abs, self.exts)
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            # Keep the observer current: a file rewritten since the last
+            # rescan must not count as settled on its *old* observed state.
+            update_observed(self.observer, cands, now_mono, now_wall)
+            settled = [c for c in cands
+                       if is_settled(self.observer.get(c[0]), now_mono,
+                                     now_wall, self.window_s)]
+            ordered = order_cands(settled)
+            cur = (self.pinned_path if self.pinned_path is not None
+                   else (self.snapshot.path if self.snapshot else None))
+            if cur is None:
+                return  # waiting state: nothing displayed, nothing to pin
+            target = nav_target(ordered,
+                                nav_anchor(ordered, cur, self.snapshot),
+                                direction)
+            if target is not None and target != cur:
+                self.pinned_path = target
+                # A normal decode request through the existing pipeline:
+                # the display is touched only in _on_load_ok (§5.4,
+                # dual buffer).
+                self.current_gen += 1
+                self.decoder.request(self.current_gen, target,
+                                     *self.decode_target())
+            else:
+                # Failed attempt (nothing on that side of the anchor, or
+                # no settled candidates): the display is unchanged — pin
+                # it anyway (R23, rev 1.5).
+                self.pinned_path = cur
+
+        def _jump(self, which):
+            """Home/End: two-phase movement (rev 1.5, R25, §5.5).
+
+            Attempt: jump to the oldest ("oldest") / newest ("newest")
+            settled candidate — absolute ends, no position anchor needed.
+            Pin: whatever is displayed is pinned — in live mode the key
+            therefore always exits live mode (at the matching end, or
+            with a single settled image, the attempt makes no change and
+            the current display is pinned in place). Recovers the
+            image-gone state on the corresponding end (stays manual). No
+            effect in single-file mode (R21); in the waiting state there
+            is nothing to pin.
+            """
+            if self.mode != "dir" or self.decoder is None:
+                return
+            cands = scan_candidates(self.dir_abs, self.exts)
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            update_observed(self.observer, cands, now_mono, now_wall)
+            settled = [c for c in cands
+                       if is_settled(self.observer.get(c[0]), now_mono,
+                                     now_wall, self.window_s)]
+            ordered = order_cands(settled)
+            cur = (self.pinned_path if self.pinned_path is not None
+                   else (self.snapshot.path if self.snapshot else None))
+            if cur is None:
+                return  # waiting state: nothing displayed, nothing to pin
+            target = None
+            if ordered:
+                target = ordered[0][0] if which == "newest" \
+                    else ordered[-1][0]
+            if target is not None and target != cur:
+                self.pinned_path = target
+                # A normal decode request through the existing pipeline:
+                # the display is touched only in _on_load_ok (§5.4,
+                # dual buffer).
+                self.current_gen += 1
+                self.decoder.request(self.current_gen, target,
+                                     *self.decode_target())
+            else:
+                # No change (already at that end, a single settled image,
+                # or no settled candidates): pin the display anyway.
+                self.pinned_path = cur
+
+        def _pause(self):
+            """p: pause (R26, §5.5) — pin whatever image is displayed,
+            with no movement attempt. In live mode this freezes the
+            stream on the current image (newer files no longer displace
+            it; an in-place update of the pinned file still reloads once
+            settled, R4). In manual mode and the image-gone state the pin
+            already is the display — no observable effect; in the waiting
+            state there is nothing to pin. No effect in single-file mode
+            (R21) and the idle state (R22). Returns whether the pin
+            actually engaged (R30 feedback: manual mode, image-gone and
+            the waiting state are no-ops → no overlay)."""
+            if self.mode != "dir" or self.decoder is None:
+                return False
+            cur = (self.pinned_path if self.pinned_path is not None
+                   else (self.snapshot.path if self.snapshot else None))
+            if cur is not None and self.pinned_path != cur:
+                self.pinned_path = cur
+                return True
+            return False
+
+        def _back_to_newest(self):
+            """n: back to live mode — the newest settled image (R23, §5.5);
+            also exits the image-gone state. No-op when already in live
+            mode (and in single-file / idle modes, where a pin can never
+            exist). Returns whether live mode was actually resumed (R30
+            feedback)."""
+            if self.pinned_path is None and not self.image_gone:
+                return False
+            self.pinned_path = None
+            if self.watcher is not None:
+                self.watcher.schedule_rescan(0)  # select the newest now
+            return True
+
+        def _refit(self):
+            """r: re-fit the window to the currently displayed image
+            (R24, §5.6). No-op in "off" mode, in --fullscreen, and when
+            no image is displayed (waiting/idle/image-gone). Does not
+            touch fitted or pinned_path, and issues no rescan."""
+            if (self.fit_mode == "off" or self.fullscreen_mode
+                    or self.snapshot is None):
+                return
+            box = self._monitor_box()
+            if box is None:
+                return
+            dims = probe_dimensions_file(self.snapshot.path) \
+                if getattr(self.snapshot, "path", None) else None
+            if dims is None:
+                dims = (self.snapshot.width, self.snapshot.height)
+            size = fit_window(self.fit_mode, dims[0], dims[1], *box)
+            _dbg(f"refit: dims={dims} box={box} -> {size}")
+            if size is not None:
+                _resize_window(self, *size)
 
         def _set_fullscreen(self, on):
             # We are the only code that changes full-screen state, so the
             # flag is the source of truth (no is_fullscreened() in the
-            # binding, §13.2). Header bar follows the mode (R16).
+            # binding, §13.2). Header bar follows the mode (R16); an
+            # active feedback overlay is dismissed immediately — the
+            # feedback channel switches with the mode (R30).
             self.fullscreen_mode = on
             self.header.set_visible(not on)
+            self._feedback_hide()
             if on:
                 self.fullscreen()
             else:
@@ -919,6 +2177,9 @@ def _gui_classes():
 
         def do_shutdown(self):
             if self.window is not None:
+                if getattr(self.window, "cycle_mode", False):
+                    self.window._cycle_stop()
+                self.window._feedback_hide()
                 if self.window.watcher is not None:
                     self.window.watcher.stop()
                 if self.window.decoder is not None:
@@ -944,7 +2205,9 @@ def run_gui(args):
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
+    args = build_parser().parse_args(_cycle_argv(argv))
     if args.version:
         print(f"riview {VERSION}")
         return OK
