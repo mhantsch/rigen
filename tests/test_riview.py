@@ -330,7 +330,7 @@ class TestCliValidation(unittest.TestCase):
     def test_version(self):
         r = run_riview("--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("riview 1.7.0", r.stdout)
+        self.assertIn("riview 1.7.3", r.stdout)
 
     def test_missing_dir_exit3(self):
         r = run_riview("--print", self.dir + "/no-such-dir")
@@ -362,9 +362,7 @@ class TestCliValidation(unittest.TestCase):
     def test_cycle_time_usage(self):  # case 8j
         for extra in (["--cycle-time", "0"], ["--cycle-time", "-3"],
                       ["--cycle-time", "9.5"], ["--cycle", "0"],
-                      ["--cycle", "2.5"],
-                      ["--cycle", "--cycle-time", "3"],
-                      ["--cycle-time", "3", "--cycle"]):
+                      ["--cycle", "2.5"]):
             r = run_riview(*extra, self.dir)
             self.assertEqual(r.returncode, 2, f"{extra}: {r.stderr}")
 
@@ -387,6 +385,18 @@ class TestCliValidation(unittest.TestCase):
         riview.validate(a)
         self.assertFalse(a.cycle)
         self.assertEqual(a.cycle_time, 3)
+        # rev 1.7.3: the flags are combinable — when both give a time,
+        # --cycle-time takes precedence (the dedicated interval option).
+        a = p.parse_args(riview._cycle_argv(
+            ["--cycle", "--cycle-time", "3", self.dir]))
+        riview.validate(a)
+        self.assertTrue(a.cycle)
+        self.assertEqual(a.cycle_time, 3)
+        a = p.parse_args(riview._cycle_argv(
+            ["--cycle", "5", "--cycle-time", "3", self.dir]))
+        riview.validate(a)
+        self.assertTrue(a.cycle)
+        self.assertEqual(a.cycle_time, 3)  # --cycle-time takes precedence
 
     def test_cycle_argv_plumbing(self):  # case 8j/36
         # The optional seconds value must not swallow the positional
@@ -803,6 +813,46 @@ class _Rec:
         return m
 
 
+class _FakeFeedbackLabel:
+    """Stand-in for the R30 feedback Gtk.Label: real .text/.visible state.
+    (The generic _Rec records calls but returns recorder functions on read,
+    so text/visibility could not be asserted on it.)"""
+
+    def __init__(self):
+        self.text = ""
+        self.visible = False
+        self.halign = None
+        self.valign = None
+        self.margin_bottom = None
+        self.calls = []  # _Rec-compatible call log (the _texts helper)
+
+    def set_css_name(self, name):
+        self.calls.append(("set_css_name", (name,)))
+
+    def set_text(self, text):
+        self.text = text
+        self.calls.append(("set_text", (text,)))
+
+    def set_margin_bottom(self, px):
+        self.margin_bottom = px
+        self.calls.append(("set_margin_bottom", (px,)))
+
+    def set_visible(self, v):
+        self.visible = v
+        self.calls.append(("set_visible", (v,)))
+
+
+class _FakeCanvas:
+    """Stand-in for the canvas container (the Gtk.Overlay below the
+    header bar): only get_height() matters (R30's show-time margin, §12.7)."""
+
+    def __init__(self, h=720):
+        self.h = h
+
+    def get_height(self):
+        return self.h
+
+
 class _FakeDecoder:
     def __init__(self):
         self.requests = []
@@ -848,7 +898,8 @@ def make_fake_window(Window, **kw):
     w.fit_mode = "off"
     w.fitted = True
     w.resize = lambda *a: None
-    w.get_height = lambda: 720  # allocated-height default for R30 margin
+    w.get_height = lambda: 720  # allocated-height default (fit-code seams)
+    w._canvas = _FakeCanvas(720)  # canvas container (R30 margin source)
     # Cycle mode (rev 1.6, R27–R29): state for _on_key / on_rescan:
     w.cycle_s = 9
     w.cycle_mode = False
@@ -858,8 +909,8 @@ def make_fake_window(Window, **kw):
     w._cycle_tick_id = None
     w._cycle_first_req = None
     w._dims = None
-    # Full-screen keypress feedback (rev 1.7, R30): label + pending timer:
-    w._feedback_label = _Rec()
+    # Key-press feedback (rev 1.7, R30): label + pending timer:
+    w._feedback_label = _FakeFeedbackLabel()
     w._feedback_id = None
     w.header = _Rec()
     for k, v in kw.items():
@@ -1525,6 +1576,46 @@ class TestCycleModeGui(unittest.TestCase):
         self.assertTrue(self._key(w, self.Gdk.KEY_c))
         self.assertFalse(w.cycle_mode)
 
+    # -- R31 (rev 1.7.2): space toggles cycle <-> pause -------------------------
+    def test_space_starts_cycle_like_c(self):
+        self._settle([("a.png", 300), ("c.png", 100)])
+        w = self._win(snapshot=snap(self._path("c.png"), 0))
+        self.assertTrue(self._key(w, self.Gdk.KEY_space))
+        self.assertTrue(w.cycle_mode)
+        self.assertIsNone(w.pinned_path)
+        self.assertIsNotNone(w._cycle_tick_id)
+        self.assertEqual(w._feedback_label.text, "cycle on: 9s")  # R30
+
+    def test_space_stops_cycle_and_pins_like_p(self):
+        self._settle([("a.png", 300), ("b.png", 200), ("c.png", 100)])
+        w = self._win(snapshot=snap(self._path("c.png"), 0))
+        self._key(w, self.Gdk.KEY_c)
+        self.assertTrue(self._key(w, self.Gdk.KEY_space))
+        self.assertFalse(w.cycle_mode)
+        self.assertEqual(w.pinned_path, self._path("c.png"))  # pinned
+        self.assertIsNone(w._cycle_tick_id)
+        self.assertEqual(w._feedback_label.text, "pause")  # R30
+
+    def test_space_toggle_roundtrip(self):
+        self._settle([("a.png", 300), ("c.png", 100)])
+        w = self._win(snapshot=snap(self._path("c.png"), 0))
+        self._key(w, self.Gdk.KEY_space)  # -> cycling
+        self.assertTrue(w.cycle_mode)
+        self._key(w, self.Gdk.KEY_space)  # -> paused (pinned)
+        self.assertFalse(w.cycle_mode)
+        self.assertEqual(w.pinned_path, self._path("c.png"))
+        self._key(w, self.Gdk.KEY_space)  # -> cycling again
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(w._feedback_label.text, "cycle on: 9s")
+
+    def test_space_noop_in_single_file_mode(self):
+        p = self._path("a.png")
+        write(p)
+        w = self._win(mode="file", only_path=p)
+        self.assertTrue(self._key(w, self.Gdk.KEY_space))
+        self.assertFalse(w.cycle_mode)
+        self.assertFalse(w._feedback_label.visible)  # no-op -> no overlay
+
     def test_left_exits_cycle_and_steps_older(self):
         self._settle([("a.png", 300), ("b.png", 200), ("c.png", 100)])
         w = self._win(snapshot=snap(self._path("c.png"), 0))
@@ -1692,12 +1783,12 @@ class TestCycleModeGui(unittest.TestCase):
 
 
 class TestFeedbackOverlay(unittest.TestCase):
-    """Spec §11 case 8k (headless): full-screen keypress feedback overlay
-    (R30, §5.8) — the pure text function, effective-only triggering,
-    full-screen-only display, 1 s expiry, replace/restart, toggle
-    dismissal and the cosmetic invariant, against the real RiviewWindow
-    methods; the on-screen look and the 1 s timing feel are the manual
-    GUI half (case 37)."""
+    """Spec §11 case 8k (headless): keypress feedback overlay (R30, §5.8)
+    — the pure text function, effective-only triggering, windowed and
+    full-screen display alike, canvas-based 10% bottom margin, 1 s expiry,
+    replace/restart, toggle dismissal and the cosmetic invariant, against
+    the real RiviewWindow methods; the on-screen look and the 1 s timing
+    feel are the manual GUI half (cases 37/38)."""
 
     @classmethod
     def setUpClass(cls):
@@ -1823,15 +1914,18 @@ class TestFeedbackOverlay(unittest.TestCase):
         self.assertEqual(self._texts(w), [])
         self.assertEqual(w.cycle_s, 1)
 
-    # -- windowed mode: no overlay (the header is the channel) --------------
-    def test_windowed_c_shows_nothing(self):
+    # -- windowed mode: the overlay fires there too (1.7.1 amendment) ------
+    def test_windowed_c_shows_too(self):
+        # pre-release amendment (riview 1.7.1): the overlay fires in windowed
+        # mode too — the header keeps its persistent status alongside it.
         self._settle([("a.png", 300), ("c.png", 100)])
         w = self._win(snapshot=snap(self._path("c.png"),
                                     self._mns("c.png")))
         self._key(w, self.Gdk.KEY_c)  # fullscreen_mode stays False
         self.assertTrue(w.cycle_mode)  # the action itself still happened
-        self.assertEqual(w._feedback_label.calls, [])
-        self.assertIsNone(w._feedback_id)
+        self.assertIn(("set_visible", (True,)), w._feedback_label.calls)
+        self.assertIn(("set_text", ("cycle on: 9s",)), w._feedback_label.calls)
+        self.assertIsNotNone(w._feedback_id)
 
     # -- no-op keypresses: no overlay (full screen) -------------------------
     def test_c_already_cycling_no_overlay(self):
@@ -1931,16 +2025,23 @@ class TestFeedbackOverlay(unittest.TestCase):
         self.assertIsNotNone(w.cycle_deadline)  # rescaled, not clobbered
         self.assertIsNotNone(w._cycle_tick_id)  # tick still armed
 
-    # -- position: bottom edge 10% up from the window bottom (§12.7) --------
-    def test_margin_is_10pct_of_window_height(self):
-        """The bottom margin is computed from the window's allocated height
-        at show time (GTK4 has no window size-changed signal to track)."""
+    # -- position: bottom edge 10% up from the canvas bottom (§12.7) --------
+    def test_margin_is_10pct_of_canvas_height(self):
+        """The bottom margin is computed from the canvas container's
+        allocated height at show time (below the header bar in windowed
+        mode; canvas == window in full screen) — GTK4 has no window
+        size-changed signal to track."""
         self._settle([("a.png", 300), ("c.png", 100)])
         w = self._fs(self._win(snapshot=snap(self._path("c.png"),
                                              self._mns("c.png"))))
-        w.get_height = lambda: 720
+        w._canvas = _FakeCanvas(720)
         self._key(w, self.Gdk.KEY_c)
         self.assertIn(("set_margin_bottom", (72,)),  # 10% of 720
+                      w._feedback_label.calls)
+        w._feedback_label.calls.clear()
+        w._canvas = _FakeCanvas(800)
+        self._key(w, self.Gdk.KEY_p)
+        self.assertIn(("set_margin_bottom", (80,)),  # 10% of 800
                       w._feedback_label.calls)
 
     def test_window_connects_no_signals(self):

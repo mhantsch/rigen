@@ -118,11 +118,12 @@ cd out && ./riview
 # Slide show (cycle mode): the settled images advance toward the newer end
 # every cycle time (default 9 s), wrapping from the newest to the oldest;
 # `--cycle` starts at the OLDEST image. `--cycle N` sets the cycle time to
-# N s; `--cycle-time N` only sets it (start the cycle with `c`) — the two
-# flags are mutually exclusive.
+# N s; `--cycle-time N` only sets it (start the cycle with `c`). The two
+# flags are combinable; when both give a time, `--cycle-time` takes
+# precedence (1.7.3).
 ./riview out --cycle
 ./riview out --cycle 5
-./riview out --cycle-time 3
+./riview out --cycle --cycle-time 3
 
 # Window fit: size the window to the first displayed image (ratio is the
 # default); exact = 1:1 logical pixels, capped at the screen; off = never
@@ -174,11 +175,17 @@ to the oldest, every *cycle time* (default 9 s; `--cycle-time N` or
 `--cycle N`); while cycling the header shows `· cycle Ns`, and `Up`/`Down`
 shorten/lengthen the cycle time by 1 s (floor 1 s) — while cycling the
 in-progress interval is rescaled (its elapsed time is preserved), so every
-following interval is the new full time. Any mode-selecting key (`Left`/
-`Right`/`Home`/`End`/`p`/`n`) stops the cycle first, then behaves as usual;
-`f`/`Esc`/`r`/double-click leave it running. In full screen, an effective
-`c`/`p`/`n`/`Up`/`Down` keypress also shows a brief 1 s on-canvas overlay —
-the header is the feedback channel in windowed mode (rev 1.7). If the
+following interval is the new full time. `space` toggles between cycle and
+pause — as `c` when not cycling, as `p` (stop and pin) while cycling (1.7.2).
+Any mode-selecting key
+(`Left`/`Right`/`Home`/`End`/`p`/`n`/`space`) stops the cycle first, then
+behaves as usual; `f`/`Esc`/`r`/double-click leave it running. In windowed or
+full-screen mode, an effective `c`/`p`/`n`/`Up`/`Down`/`space` keypress also
+shows a brief 1 s
+on-canvas overlay — pale-yellow text on a semi-transparent gray shade,
+bottom center, its bottom edge about 10% up from the canvas bottom; in
+windowed mode the header keeps its status alongside it (rev 1.7, window
+mode added in 1.7.1). If the
 pinned file is deleted or renamed away the canvas goes black with a message;
 `Left`/`Right` keep scanning from where the image was (the pin remembers its
 mtime), and the display restores itself if the file reappears. `r` re-fits the

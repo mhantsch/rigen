@@ -1,10 +1,11 @@
 # riview — Reloading Image Viewer — Software Specification & Design
 
-**Status:** rev 1.7 — full-screen keypress feedback: a 1 s on-canvas overlay for
-the effective `c`/`p`/`n`/`Up`/`Down` keypresses in `--fullscreen` mode (new
-R30, §5.8; implemented as `riview` 1.7.0 — pale-yellow 2.5× text on a
-semi-transparent gray shade, bottom center with its bottom edge about 10% up
-from the canvas; §11 cases 8k + 37). Rev 1.6: cycle mode (slide show) +
+**Status:** rev 1.7 — keypress feedback: a 1 s on-canvas overlay for the
+effective `c`/`p`/`n`/`Up`/`Down` keypresses in windowed and `--fullscreen`
+modes alike (new R30, §5.8; implemented as `riview` 1.7.2 — pale-yellow 2.5×
+text on a semi-transparent gray shade, bottom center with its bottom edge
+about 10% up from the canvas bottom; §11 cases 8k + 37/38), plus the `space`
+cycle/pause toggle (new R31; §11 cases 8l + 39); `--cycle` is **combinable** with `--cycle-time` (when both give a time, `--cycle-time` takes precedence — riview 1.7.3 fix, R29). Rev 1.6: cycle mode (slide show) +
 `--cycle-time`, `Up`/`Down`
 cycle-time adjustment, `--cycle` startup flag (new R27–R29, §5.7, D18/D19;
 all detail assumptions confirmed by the spec owner, including the rev-1.6
@@ -48,8 +49,8 @@ prints the `VERSION` constant (§12.3).
 | 1.3 | **`--fit ratio` COSMIC cap (new D15):** the spec owner's research found upstream bug reports: the COSMIC compositor reconfigures mapped windows larger than a certain size (the rev 1.2 diagnostic instrumentation — `SIZE` size watch + late check after a reached grow — established the behavior is **not** related to the window's position on screen; the earlier work-area/placement theory was wrong). Decision (spec owner): for now, cap the `ratio` fit box at **1600×1200 logical pixels (width × height)** — the image is ratio-fitted inside the smaller of the 80 % budget box and this fixed cap (`COSMIC_CAP_W`/`COSMIC_CAP_H`, §5.6/§12.3); `exact` and `off` are unchanged; the 320 px floor still applies to the capped fit. Revisit (raise or delete the cap) after a COSMIC update fixes the clamping. The debug note now cites the COSMIC bug instead of a placement limit. Behavior change: rev 1.3 ↔ `riview` 1.3.0 (4 new unit tests — cap width-bind, height-bind, the spec owner's 1024² case, and `exact`-not-capped). §5.6/§12.3/§13.2. |
 | 1.4 | **Home/End jump (new R25 + §4.4 + §5.5 + §12.9):** in directory mode, `Home` jumps the display to the **oldest** settled image and `End` to the **newest** — both **pin** the display (manual mode, R23 pinning semantics); `End` deliberately does **not** resume live following (that remains `n`). No-ops: single-file mode (R21), the idle state (R22), the waiting state (no settled candidates), and when the target is already the displayed/pinned file — so `End` in live mode is a no-op (the live display is the newest) and repeated presses at an end are no-ops. Unlike `Left`/`Right`, both work **from the image-gone state** (the jump target does not depend on the pin): the display recovers and stays manual. Key conventions as R18 (bare key, Shift tolerated; windowed and full-screen alike). Jumps never resize the window (R24); `--print` unaffected. Decision D16 (spec owner). §11 case 32; 6 new headless tests. |
 | 1.5 | **Movement keys always pin; `p` pause; position-preserving image-gone (R23/R25 revised, new R26, D17):** every movement key (`Left`/`Right`/`Home`/`End`) is **two-phase** — *attempt a movement* over the settled candidate list (loading the target only when it differs from the display), then **pin whatever is displayed**; a failed attempt still pins. Consequences: in live mode every movement key **exits live mode** — `Right`/`End` (and `Left`/`Home` with a single settled image) pin the current display in place, the "freeze the stream" action; manual movement is otherwise unchanged (step/jump, load on change). The `Left`/`Right` anchor is the position where the displayed version sorts in the list by `(mtime, path)` — its own entry when settled, else the virtual position of its last known `(mtime, path)` — so **`Left`/`Right` work from the image-gone state** (the pin holds its last mtime; scanning continues after deleting the displayed file) and from a rewrite in flight. New key **`p`** (R26): pins the displayed image with no movement attempt. `n` remains the only key that resumes live mode. The image-gone message now also offers scanning. The "no-op / clamped-ignored" wording for movement keys is replaced throughout by the two-phase rule (R23/R25, §4.4, §5.5, §11, §12.9). Decision D17 (spec owner); D16 is superseded. Behavior change: rev 1.5 ↔ `riview` 1.5.1 (anchor-based `nav_target`, new `nav_anchor`; new freeze/pause/gone-stepping tests). *Patch 1.5.1:* implementation bug fix, no behavior change — the "newer" branch of `nav_target` iterated the list newest-first, so `Right` jumped to the **newest** candidate instead of stepping to the adjacent newer one (the "older" branch was correct); the walk test's missing intermediate assertions let it through. |
-| 1.6 | **Cycle mode / slide show (new R27–R29, new §5.7, §4.4, §12.9, D18/D19):** `c` enters **cycle mode**: starting at the currently displayed image, the display advances one *settled* image at a time toward the **newer** end of the navigation list (§5.5) every **cycle time**, wrapping from the newest to the **oldest** image and continuing. Live following (R3) is suspended while cycling: newly settled images do **not** interrupt the display — they join the list at the newest end and are shown when the cycle reaches them (the cycle grows as images are added; deleted files drop out). Any mode-selecting keypress exits cycle mode first, then applies its normal semantics (`Left`/`Right`/`Home`/`End`/`p` two-phase → manual, R23/R25/R26; `n` → live). Cycle time: `--cycle-time` (integer seconds, min 1, default **9**), dynamically adjustable with `Up`/`Down` (±1 s, floor 1 s), during *or* outside cycle mode — an adjustment rescales the current interval (elapsed time preserved, see the amendment below). Cycle position is re-derived from an anchor each tick (the §5.5 `nav_anchor` philosophy, so the list may grow/shrink underneath the cycle); failed decodes (R15) are skipped, never retried. Behaviour change: rev 1.6 ↔ `riview` 1.6.0. **Detail assumptions, confirmed by the spec owner (rev-1.6 review):** [A1] `c` while already cycling is a no-op (not a toggle); [A2] `p` is treated as a navigation key — it stops cycling and pins (manual); [A3] a deleted currently-shown slide is held on the canvas (no image-gone state) until the next advance, which continues from where the image was; [A4] cycling survives the list going empty (waiting state, R8) and resumes on the first settled candidate; [A5] `c` in the waiting state enters cycle mode armed — the first settled candidate becomes the first slide at the next advance; [A6] `--cycle-time` is integer seconds ≥ 1 — no fractions (0/negative → exit 2); [A7] the first advance is a full cycle time after `c`; the clock is not reset by new-image arrivals; a decode failure holds the previous slide and the next advance skips the failed file; [A8] `f`/`Esc`/`r`/canvas double-click leave cycle mode running; [A9] the header subtitle shows `· cycle Ns` while cycling (visible `Up`/`Down` feedback; hidden in `--fullscreen` per R16); [A10] *amended* — `Up`/`Down` rescale the **current** interval: the elapsed time of the in-progress slide is preserved (remaining = new time − elapsed; if the new time is shorter than the elapsed time the advance fires at the next tick), and every following interval uses the new full cycle time — worked example: cycle time 9 s with 2 s elapsed, `Down`×2 → 7 s, so this slide advances after 5 s and the next image gets a full 7 s; outside cycle mode the keys adjust the stored value only. Also confirmed (rev-1.6 review): a new time **shorter** than the elapsed time advances the slide pretty much immediately (next tick); an in-place rewrite of the currently shown slide reloads (R4) with the cycle clock **kept advancing** (defined edge case, confirmed). **Final amendment (spec owner):** a `--cycle` flag automatically enters cycle mode at startup; the first slide is the **oldest** settled image (R29, D19 — the spec owner's stated preference; starting at the newest and wrapping on the first advance was the acceptable fallback). Amended again by the spec owner: `--cycle` and `--cycle-time` are **mutually exclusive** (exit 2), and `--cycle` takes an **optional value in seconds** — the initial cycle time (flag alone = the 9 s default). |
-| 1.7 | **Full-screen keypress feedback (new R30 + §5.8, §4.4, §12.7/§12.9):** in `--fullscreen` mode (R16) the header — the feedback channel for cycle mode and keypresses in windowed mode (R10/R28) — is hidden, so the spec owner asked for short, on-canvas feedback of mode-changing keypresses. The **effective** keypresses `c`, `p`, `n`, `Up`/`Down` now show an overlay — pale-yellow text (2.5× the normal size) on a semi-transparent gray shade, centered horizontally with its bottom edge about 10% up from the bottom of the canvas — for **1 second**: `c` → `cycle on: {N}s`, `p` → `pause`, `n` → `newest live image`, `Up`/`Down` → `cycle: {N}s` (N = the current cycle time). No-op keypresses show nothing — the overlay fires only when the keypress effects its named change, mirroring the §4.4/§5.5/§5.7 no-op rules (e.g. `c` while cycling / idle / single-file, `n` in live mode, `p` in manual / image-gone / waiting, `Down` at the 1 s floor). The overlay is full-screen-only (windowed mode keeps the header as the feedback channel — no doubling); a further feedback keypress within the 1 s replaces the text and restarts the timer (last wins); a full-screen toggle (`f`/`Esc`/double-click) dismisses an active overlay immediately; nothing is shown at startup (e.g. `--cycle --fullscreen` opens without one). Purely cosmetic: the cycle clock (R28), selection (R3), decode (R7), and window size (R24) are unaffected; `f`/`Esc`/`r`/double-click/`q` show no overlay; `--print` unaffected (no window). R16 amended with the transient exception. Behaviour change: rev 1.7 ↔ `riview` 1.7.0. §11 cases 8k + 37. |
+| 1.6 | **Cycle mode / slide show (new R27–R29, new §5.7, §4.4, §12.9, D18/D19):** `c` enters **cycle mode**: starting at the currently displayed image, the display advances one *settled* image at a time toward the **newer** end of the navigation list (§5.5) every **cycle time**, wrapping from the newest to the **oldest** image and continuing. Live following (R3) is suspended while cycling: newly settled images do **not** interrupt the display — they join the list at the newest end and are shown when the cycle reaches them (the cycle grows as images are added; deleted files drop out). Any mode-selecting keypress exits cycle mode first, then applies its normal semantics (`Left`/`Right`/`Home`/`End`/`p` two-phase → manual, R23/R25/R26; `n` → live). Cycle time: `--cycle-time` (integer seconds, min 1, default **9**), dynamically adjustable with `Up`/`Down` (±1 s, floor 1 s), during *or* outside cycle mode — an adjustment rescales the current interval (elapsed time preserved, see the amendment below). Cycle position is re-derived from an anchor each tick (the §5.5 `nav_anchor` philosophy, so the list may grow/shrink underneath the cycle); failed decodes (R15) are skipped, never retried. Behaviour change: rev 1.6 ↔ `riview` 1.6.0. **Detail assumptions, confirmed by the spec owner (rev-1.6 review):** [A1] `c` while already cycling is a no-op (not a toggle); [A2] `p` is treated as a navigation key — it stops cycling and pins (manual); [A3] a deleted currently-shown slide is held on the canvas (no image-gone state) until the next advance, which continues from where the image was; [A4] cycling survives the list going empty (waiting state, R8) and resumes on the first settled candidate; [A5] `c` in the waiting state enters cycle mode armed — the first settled candidate becomes the first slide at the next advance; [A6] `--cycle-time` is integer seconds ≥ 1 — no fractions (0/negative → exit 2); [A7] the first advance is a full cycle time after `c`; the clock is not reset by new-image arrivals; a decode failure holds the previous slide and the next advance skips the failed file; [A8] `f`/`Esc`/`r`/canvas double-click leave cycle mode running; [A9] the header subtitle shows `· cycle Ns` while cycling (visible `Up`/`Down` feedback; hidden in `--fullscreen` per R16); [A10] *amended* — `Up`/`Down` rescale the **current** interval: the elapsed time of the in-progress slide is preserved (remaining = new time − elapsed; if the new time is shorter than the elapsed time the advance fires at the next tick), and every following interval uses the new full cycle time — worked example: cycle time 9 s with 2 s elapsed, `Down`×2 → 7 s, so this slide advances after 5 s and the next image gets a full 7 s; outside cycle mode the keys adjust the stored value only. Also confirmed (rev-1.6 review): a new time **shorter** than the elapsed time advances the slide pretty much immediately (next tick); an in-place rewrite of the currently shown slide reloads (R4) with the cycle clock **kept advancing** (defined edge case, confirmed). **Final amendment (spec owner):** a `--cycle` flag automatically enters cycle mode at startup; the first slide is the **oldest** settled image (R29, D19 — the spec owner's stated preference; starting at the newest and wrapping on the first advance was the acceptable fallback). Amended again by the spec owner: `--cycle` takes an **optional value in seconds** — the initial cycle time (flag alone = the 9 s default); originally also made **mutually exclusive** with `--cycle-time` (exit 2) — **retracted by the spec owner as a confirmation mistake (riview 1.7.3 fix)**: `--cycle` carries no interval of its own, so the combination is unambiguous — the flags are **combinable**: `--cycle --cycle-time 3` starts the cycle at 3 s, and when both give a time `--cycle-time` takes precedence. |
+| 1.7 | **Full-screen keypress feedback (new R30 + §5.8, §4.4, §12.7/§12.9):** in `--fullscreen` mode (R16) the header — the feedback channel for cycle mode and keypresses in windowed mode (R10/R28) — is hidden, so the spec owner asked for short, on-canvas feedback of mode-changing keypresses. The **effective** keypresses `c`, `p`, `n`, `Up`/`Down` now show an overlay — pale-yellow text (2.5× the normal size) on a semi-transparent gray shade, centered horizontally with its bottom edge about 10% up from the bottom of the canvas — for **1 second**: `c` → `cycle on: {N}s`, `p` → `pause`, `n` → `newest live image`, `Up`/`Down` → `cycle: {N}s` (N = the current cycle time). No-op keypresses show nothing — the overlay fires only when the keypress effects its named change, mirroring the §4.4/§5.5/§5.7 no-op rules (e.g. `c` while cycling / idle / single-file, `n` in live mode, `p` in manual / image-gone / waiting, `Down` at the 1 s floor). The overlay is shown in **windowed and full-screen modes alike** (pre-release amendment — originally full-screen-only, the windowed header keeps its persistent status instead of acting as the sole feedback channel); a further feedback keypress within the 1 s replaces the text and restarts the timer (last wins); a full-screen toggle (`f`/`Esc`/double-click) dismisses an active overlay immediately; nothing is shown at startup (e.g. `--cycle --fullscreen` opens without one). Purely cosmetic: the cycle clock (R28), selection (R3), decode (R7), and window size (R24) are unaffected; `f`/`Esc`/`r`/double-click/`q` show no overlay; `--print` unaffected (no window). R16 amended with the transient exception. Behaviour change: rev 1.7 ↔ `riview` 1.7.0. §11 cases 8k + 37. **Pre-release amendment (spec owner, before any 1.7 release):** the overlay is **not** full-screen-only — it shows in **windowed mode too** (the header keeps its persistent status, R10 — the overlay is the transient confirmation in both modes; the no-doubling rationale is retired), and its bottom edge is 10% up from the **canvas** bottom (the image area below the header bar — full-screen appearance is unchanged, there canvas == window), measured from the canvas container's allocated height at show time. Tracked as `riview` 1.7.1. §11 case 38. **Pre-release amendment 2 (spec owner, `riview` 1.7.2):** `space` **toggles between cycle and pause** — while not cycling it acts exactly as `c` (starts the cycle, overlay `cycle on: {N}s`), while cycling it acts exactly as `p` (stops the cycle and pins the current slide, overlay `pause`); no new mode, state, or message — an alias chosen by the current mode, inheriting all `c`/`p` no-op rules (R31, §4.4, §5.7, §11 cases 8l + 39). |
 
 ---
 
@@ -89,11 +90,14 @@ the newer end every *cycle time* (default 9 s, `--cycle-time`; `Up`/`Down`
 adjust it live), wrapping around at the newest image (R27/R28). `--cycle`
 starts in cycle mode at launch, beginning at the **oldest** image (R29).
 
-Since rev 1.7, in full-screen mode the mode-changing keypresses give brief
-on-canvas feedback — a 1 s pale-yellow overlay on a semi-transparent gray
-shade, centered horizontally about 10% up from the bottom of the canvas
-(`cycle on: {N}s` / `pause` / `newest live image` / `cycle: {N}s`) — since the
-header is hidden there (R30, §5.8).
+Since rev 1.7, the mode-changing keypresses give brief on-canvas feedback —
+a 1 s pale-yellow overlay on a semi-transparent gray shade, centered
+horizontally about 10% up from the bottom of the canvas (`cycle on: {N}s` /
+`pause` / `newest live image` / `cycle: {N}s`) — in windowed and full-screen
+modes alike: in full screen the header is hidden (R16), and in windowed mode
+the header keeps its persistent status while the overlay is the transient
+confirmation (`space` shows the text of its dispatched action, R31; R30,
+§5.8).
 
 Design goals, in order:
 
@@ -168,11 +172,12 @@ Design goals, in order:
 | R23 | **Manual navigation (directory mode):** with the window focused, every **movement key** is **two-phase (rev 1.5)**: *attempt a movement* over the navigation list (settled candidates, §5.5) — the display loads the target only when the attempt resolves to a candidate different from the current display — and then **pin whatever is displayed**. `Left`/`Right` attempt a step one image toward the older / newer end, from the position where the displayed version sorts in the list by `(mtime, path)` (§4.3 order); when the displayed file is not a settled candidate — the **image-gone** state (the pin holds the file's last mtime) or a **rewrite in flight** (the last displayed version's mtime) — the position is that last known `(mtime, path)`, so scanning continues from where the image was. A failed attempt (nothing on that side, no settled candidates) leaves the display unchanged; the pin phase still applies. In **live mode** every movement key therefore **exits live mode** (pins the display, or the stepped-to image); in manual mode the pin phase is unobservable (already pinned). `n` returns to the **newest** image and resumes **live mode** (R1/R3) — the only key that does. While a manual selection is active the display is **pinned** to the chosen file: files that settle *newer* while the user is browsing do **not** displace it (the newer-only rule, R3, is suspended for the pinned display), and an in-place update of the pinned file reloads once settled (R4) — pinning never blocks an in-place update of the pinned file itself. If the pinned file ceases to be a *candidate* (deleted, renamed away), the display enters the **image-gone state**: the canvas goes black with the white message *"Current image gone — 'n' jumps to the newest, ←/→ keep scanning."* (hidden in `--fullscreen` like all waiting texts, R16); the pin **persists with its last mtime** — `Left`/`Right` step from that position, the file reappearing and settling restores the display, and `n` exits the state by jumping to the newest and resuming live mode. In single-file mode (R21) the movement keys have no observable effect (the displayed file is the only candidate); in the idle state (R22) there is no directory. Key conventions as R18: bare keys (Shift tolerated), windowed and full-screen mode alike. |
 | R24 | **Window fit:** the window opens at the D11 **pre-image default** (80 % of the primary monitor, min 900×675 — the waiting size; the window is not placed yet, so its own monitor is not addressable) and, on the **first successful decode that reaches the display**, is resized **once** so that the *canvas* (window minus the header bar) matches the displayed image per the **fit mode** (`--fit`, synonym `--fit-window`): `ratio` (default) — the largest rectangle of the image's aspect ratio that fits the 80 % budget box — itself capped at the fixed D15 COSMIC box (1600×1200 logical px, width × height) until the upstream COSMIC clamping bug is fixed — with the header height subtracted from the available height, so the first displayed image has **no letterbox**; `exact` — the image's dimensions in logical pixels (physical ÷ window scale factor), capped at the **full monitor minus the header** (degrading to a ratio fit within that cap when the image is larger than the screen; the window then fills the screen but keeps its header bar — deliberately not `--fullscreen`); `off` — no resize (pre-image size only). A fit result below **320 logical pixels** on either side is recomputed as the largest ratio-preserving rectangle within a 320×320 box. After the fit pass the window is **never auto-resized again**: new loads, in-place updates, and manual navigation (R23) all leave it alone (letterbox as usual, R9/R17). The fit budget and the `exact` cap are measured on the **monitor the window is currently on** (queried at fit time; the primary monitor — or the first monitor — when undetermined, e.g. before window-manager placement), so dragging the window to another screen and pressing `r` re-fits to *that* screen. `r` (R18 key conventions) re-fits on demand to the *currently displayed* image using the same computation — in directory and single-file modes alike; a no-op in `off` mode, the waiting/idle/image-gone states, and `--fullscreen`. The option is inert in `--print` and `--fullscreen`. |
 | R25 | **Home/End jump (directory mode):** `Home`/`End` are two-phase movement keys (R23, rev 1.5): the attempt jumps to the **oldest** / **newest** settled candidate — absolute list ends, no position anchor needed; the display loads it when it differs from the current display; then whatever is displayed is pinned. In live mode they therefore always exit live mode — at the matching end (or with a single settled image) the attempt makes no change and the current display is **pinned in place** (freeze). In the image-gone state they recover the display on the oldest/newest settled candidate (staying manual). In single-file mode (R21) they have no observable effect; in the waiting state (nothing displayed) there is nothing to pin. Key conventions as R18 (bare key, Shift tolerated; windowed and full-screen alike). A jump never resizes the window (R24). |
-| R26 | **Pause key (directory mode):** `p` pins whatever image is currently displayed, with **no movement attempt** — the pure "stay on this image" key: in live mode it freezes the stream (newer files no longer displace the display; an in-place update of the pinned file still reloads once settled, R4). In manual mode, the image-gone state, and the waiting state it has no observable effect (the pin already is the display / nothing is displayed). It is the only key that pins without moving — in the brief rewrite-in-flight window, where `Home`/`End` jump to a settled end, `p` keeps the displayed image. `n` resumes live mode (R23). Key conventions as R18 (bare key, Shift tolerated; windowed and full-screen alike). No window resize (R24); `--print` unaffected. |
-| R27 | **Cycle mode — slide show (directory mode):** with the window focused, `c` (R18 key conventions) enters **cycle mode**: starting at the currently displayed image, the display **advances** one settled image at a time toward the **newer** end of the navigation list (§5.5) every **cycle time** (R28); when the newest settled image is reached, the cycle **wraps to the oldest** settled image and continues. Only **settled** candidates are ever shown — a file still inside its settle window is never a slide (§5.5 rationale). While cycling, live following is **suspended** (R3): newly settled images do **not** interrupt the display; they join the cycle list at the newest end and are shown when the cycle reaches them — the cycle **grows** as new images settle, and files deleted from the directory drop out of the list. Each advance is a normal decode request (dual-buffered, R7); a slide whose version fails to decode (R15) is skipped by subsequent advances, never retried. The cycle position is **re-derived from an anchor on every advance** (the displayed version's entry in the list, or its virtual `(mtime, path)` position when the displayed file is not a settled candidate — §5.5 anchor rules), never stored as an index, so the list may grow and shrink underneath the cycle. Any keypress that selects a display mode **exits cycle mode first**, then applies its normal semantics: `Left`/`Right`/`Home`/`End`/`p` are two-phase as usual (R23/R25/R26) — the attempt resolves against the currently displayed image and then pins it (→ manual mode); `n` exits to **live** mode (newest, R3 resumed). Keys that do not select a display mode — `f`, `Esc`, `r`, the canvas double-click — leave cycle mode running. `c` while already in cycle mode is a no-op. If the currently shown slide ceases to be a candidate (deleted, renamed away), the canvas **holds the last decoded slide** (no image-gone state while cycling); the next advance continues from where that image was (virtual anchor). If no settled candidate exists (nothing on the list), the display shows the waiting state (R8) and cycle mode **stays active** — the first settling candidate becomes a slide at the next advance. `c` in the waiting state enters cycle mode immediately (armed): no advance occurs until the first candidate settles. An in-place update of the displayed slide reloads once settled (R4), as with pinning; the next advance anchors on the new version. In single-file mode (R21) `c` has no observable effect (a one-element cycle would re-show the same image every interval). In the idle state (R22) there is no directory. Advances never resize the window (R24); `--print` unaffected. |
+| R26 | **Pause key (directory mode):** `p` pins whatever image is currently displayed, with **no movement attempt** — the pure "stay on this image" key: in live mode it freezes the stream (newer files no longer displace the display; an in-place update of the pinned file still reloads once settled, R4). In manual mode, the image-gone state, and the waiting state it has no observable effect (the pin already is the display / nothing is displayed). It is the only key that pins without moving — in the brief rewrite-in-flight window, where `Home`/`End` jump to a settled end, `p` keeps the displayed image. `n` resumes live mode (R23). `space` while cycling dispatches here (R31). Key conventions as R18 (bare key, Shift tolerated; windowed and full-screen alike). No window resize (R24); `--print` unaffected. |
+| R27 | **Cycle mode — slide show (directory mode):** with the window focused, `c` (or `space` when not cycling, R31 — R18 key conventions) enters **cycle mode**: starting at the currently displayed image, the display **advances** one settled image at a time toward the **newer** end of the navigation list (§5.5) every **cycle time** (R28); when the newest settled image is reached, the cycle **wraps to the oldest** settled image and continues. Only **settled** candidates are ever shown — a file still inside its settle window is never a slide (§5.5 rationale). While cycling, live following is **suspended** (R3): newly settled images do **not** interrupt the display; they join the cycle list at the newest end and are shown when the cycle reaches them — the cycle **grows** as new images settle, and files deleted from the directory drop out of the list. Each advance is a normal decode request (dual-buffered, R7); a slide whose version fails to decode (R15) is skipped by subsequent advances, never retried. The cycle position is **re-derived from an anchor on every advance** (the displayed version's entry in the list, or its virtual `(mtime, path)` position when the displayed file is not a settled candidate — §5.5 anchor rules), never stored as an index, so the list may grow and shrink underneath the cycle. Any keypress that selects a display mode **exits cycle mode first**, then applies its normal semantics: `Left`/`Right`/`Home`/`End`/`p` are two-phase as usual (R23/R25/R26) — the attempt resolves against the currently displayed image and then pins it (→ manual mode); `n` exits to **live** mode (newest, R3 resumed). Keys that do not select a display mode — `f`, `Esc`, `r`, the canvas double-click — leave cycle mode running. `c` while already in cycle mode is a no-op. If the currently shown slide ceases to be a candidate (deleted, renamed away), the canvas **holds the last decoded slide** (no image-gone state while cycling); the next advance continues from where that image was (virtual anchor). If no settled candidate exists (nothing on the list), the display shows the waiting state (R8) and cycle mode **stays active** — the first settling candidate becomes a slide at the next advance. `c` in the waiting state enters cycle mode immediately (armed): no advance occurs until the first candidate settles. An in-place update of the displayed slide reloads once settled (R4), as with pinning; the next advance anchors on the new version. In single-file mode (R21) `c` has no observable effect (a one-element cycle would re-show the same image every interval). In the idle state (R22) there is no directory. Advances never resize the window (R24); `--print` unaffected. |
 | R28 | **Cycle time:** the cycle time is set by `--cycle-time` — **integer seconds, minimum 1, default 9** (`0` or negative → usage error, exit 2). `Up`/`Down` (R18 key conventions) **increase / decrease the cycle time by 1 second** at any time — during *or* outside cycle mode — without changing the mode or the display; `Down` at the minimum (1 s) has no effect. An adjustment **rescales the current interval immediately**: the elapsed time of the in-progress slide is preserved — its deadline becomes `now + (new time − elapsed)`; if the new time is **shorter** than the elapsed time (the slide has already outlived its new allotment) the advance fires at the next tick; every following interval is the new full cycle time (worked example: 9 s with 2 s elapsed, `Down`×2 → 7 s → this slide advances after 5 s, the next image gets a full 7 s). The first advance occurs a full cycle time after `c` (the starting image is shown for one full interval), and the cycle clock is not reset by new-image arrivals or by decode failures. While cycling, the header subtitle shows the current value — the R10 subtitle plus ` · cycle {N}s` — so `Up`/`Down` adjustments are visible; the header is hidden in `--fullscreen` (R16), where the R30 overlay (`cycle: {N}s`, `cycle on: {N}s`) is the visible feedback instead. |
-| R29 | **Cycle mode at startup (`--cycle`):** with the flag `--cycle`, `riview` enters **cycle mode automatically at process start** — before any display — instead of starting in live mode: the **first displayed image is the oldest settled candidate** (the last entry of the cycle list, §5.7), not the newest that R3 would show at startup; from there the cycle advances toward the newer end every cycle time and wraps from the newest to the oldest exactly as usual (R27). If no candidate is settled at startup, the waiting state (R8) is shown with cycle mode armed (as for `c` in the waiting state, R27) and the first displayed image is the **oldest** candidate of the first non-empty settled list. No live-mode window ever opens: the first display already belongs to the cycle. All other `--cycle`/cycle-mode semantics are R27/R28 (keys, rescale, wrap, failed-skip, image-gone hold). `--cycle` takes an **optional value — the initial cycle time in seconds** (the flag alone = the R28 default of 9 s; a value must be an integer ≥ 1, §4.2) and is **mutually exclusive with `--cycle-time`** (usage error, exit 2). In single-file mode (R21) `--cycle` has no observable effect; in `--print` mode (R12) the flag is inert (no window, no cycle state). |
-| R30 | **Full-screen keypress feedback (overlay):** in `--fullscreen` mode (R16) the header — the feedback channel for `c` and `Up`/`Down` in windowed mode (R10/R28) — is hidden, so an **effective** keypress of `c`, `p`, `n`, `Up`, or `Down` shows a **brief text overlay** on the canvas for **1 second**, then it disappears: `c` → `cycle on: {N}s`, `p` → `pause`, `n` → `newest live image`, `Up`/`Down` → `cycle: {N}s` (N = the current cycle time). An overlay appears **only when the keypress effects its named change** — no-op keypresses show nothing (`c` while already cycling / in the idle state / in single-file mode (R21); `p` in manual mode, the image-gone state, or the waiting state (R26); `n` when already in live mode (R23); `Down` at the 1 s floor (R28)). The overlay is **full-screen-only**: in windowed mode the header (R10 subtitle, `· cycle {N}s` indicator, R28) is the feedback channel and no overlay appears. A further feedback keypress within the 1 s **replaces the text and restarts the 1 s timer** (last wins). A full-screen toggle (`f`/`Esc`/canvas double-click) **dismisses an active overlay immediately**. The overlay is purely cosmetic: it does not affect the cycle clock or deadlines (R28), selection (R3/R5), decode (R7), or window size (R24); nothing is shown at startup (e.g. `--cycle --fullscreen` opens without one); `f`/`Esc`/`r`/double-click/`q` show no overlay; `--print` mode is unaffected (no window, R12). |
+| R29 | **Cycle mode at startup (`--cycle`):** with the flag `--cycle`, `riview` enters **cycle mode automatically at process start** — before any display — instead of starting in live mode: the **first displayed image is the oldest settled candidate** (the last entry of the cycle list, §5.7), not the newest that R3 would show at startup; from there the cycle advances toward the newer end every cycle time and wraps from the newest to the oldest exactly as usual (R27). If no candidate is settled at startup, the waiting state (R8) is shown with cycle mode armed (as for `c` in the waiting state, R27) and the first displayed image is the **oldest** candidate of the first non-empty settled list. No live-mode window ever opens: the first display already belongs to the cycle. All other `--cycle`/cycle-mode semantics are R27/R28 (keys, rescale, wrap, failed-skip, image-gone hold). `--cycle` takes an **optional value — the initial cycle time in seconds** (the flag alone = the R28 default of 9 s; a value must be an integer ≥ 1, §4.2) and is **combinable with `--cycle-time`** — when both give a time, **`--cycle-time` takes precedence** (the dedicated interval option; the flag's value is then ignored — rev 1.7.3 fix). In single-file mode (R21) `--cycle` has no observable effect; in `--print` mode (R12) the flag is inert (no window, no cycle state). |
+| R30 | **Keypress feedback (overlay):** an **effective** keypress of `c`, `p`, `n`, `Up`, `Down`, or `space` shows a **brief text overlay** on the canvas for **1 second**, in **windowed and `--fullscreen` (R16) modes alike**, then it disappears: `c` → `cycle on: {N}s`, `p` → `pause`, `n` → `newest live image`, `Up`/`Down` → `cycle: {N}s`, `space` → the text of the action it dispatches (R31) (N = the current cycle time). An overlay appears **only when the keypress effects its named change** — no-op keypresses show nothing (`c` while already cycling / in the idle state / in single-file mode (R21); `p` in manual mode, the image-gone state, or the waiting state (R26); `n` when already in live mode (R23); `Down` at the 1 s floor (R28); `space` when its dispatch is a no-op (R31)). The overlay appears **in both modes** (pre-release amendment, tracked as `riview` 1.7.1): in windowed mode the header (R10 subtitle, `· cycle {N}s` indicator, R28) keeps its **persistent** status — the overlay is the **transient** confirmation (the original no-doubling rationale is retired). Position: bottom center of the canvas, its bottom edge **10% up from the canvas bottom** (below the header bar in windowed mode; canvas == window in full screen), computed from the canvas container's allocated height at show time. A further feedback keypress within the 1 s **replaces the text and restarts the 1 s timer** (last wins). A full-screen toggle (`f`/`Esc`/canvas double-click) **dismisses an active overlay immediately**. The overlay is purely cosmetic: it does not affect the cycle clock or deadlines (R28), selection (R3/R5), decode (R7), or window size (R24); nothing is shown at startup (e.g. `--cycle --fullscreen` opens without one); `f`/`Esc`/`r`/double-click/`q` show no overlay; `--print` mode is unaffected (no window, R12). |
+| R31 | **`space` — the cycle/pause toggle (directory mode, rev 1.7.2):** `space` toggles between **cycle mode** (R27) and **pause** (R26), the action being chosen by the current mode: while **not** cycling it acts *exactly* as `c` — it starts cycle mode from the currently displayed image (all R27 semantics, including the no-ops in the idle state and in single-file mode); while **cycling** it acts *exactly* as `p` — it stops the cycle and pins the current slide (manual mode, the R26 stop-and-pin). Pressing it again reverses: from the pause it restarts the cycle at the currently displayed image (as `c`). It shows the R30 overlay of the action it dispatches (`cycle on: {N}s` / `pause`) exactly when that action is effective; a no-op dispatch shows nothing. No new mode, state, or message — `space` is an alias, and every existing `c`/`p` rule applies to it unchanged. |
 
 ### 3.1 Non-functional
 
@@ -208,8 +213,8 @@ it may be a `file://` URI (the desktop entry's `%U`, R20).
 | `TARGET` (positional) | path | none (see R22) | Directory or image file to watch (R21). No target: CWD when launched from a terminal, idle state in a GUI context (R22). |
 | `--extensions` | comma list | `png,jpg,jpeg,webp,gif,tiff,tif,bmp` | Candidate extensions, lowercase, without dots. Case-insensitive on input. The empty list is a usage error. (`avif` and `svg` loaders exist on the target system and may be added here; they are not in the default set by design decision D4.) Filters selection *inside directories* only — an explicit file target bypasses it (R21). |
 | `--stable-ms` | int ≥ 0 | `2000` | Settle window in milliseconds (§5.3). `0` disables the window (file displayable as soon as first observed — for testing). |
-| `--cycle-time` | int seconds ≥ 1 | `9` | Cycle time for cycle mode (R27/R28, §5.7): seconds between cycle advances. Minimum 1 (`0` or negative → exit 2). `Up`/`Down` adjust the value at runtime (±1 s, floor 1 s), during or outside cycle mode — while cycling an adjustment rescales the current interval (R28). Mutually exclusive with `--cycle` (§4.2). |
-| `--cycle [SECONDS]` | optional int seconds ≥ 1 (flag = default 9) | off | Enter cycle mode automatically at startup; the first slide is the **oldest** settled image (R29, §5.7). The optional value sets the **initial cycle time** (R28); **mutually exclusive with `--cycle-time`** (exit 2, §4.2). Inert in single-file mode (R21) and `--print` mode (R12). |
+| `--cycle-time` | int seconds ≥ 1 | `9` | Cycle time for cycle mode (R27/R28, §5.7): seconds between cycle advances. Minimum 1 (`0` or negative → exit 2). `Up`/`Down` adjust the value at runtime (±1 s, floor 1 s), during or outside cycle mode — while cycling an adjustment rescales the current interval (R28). Combinable with `--cycle`; when both give a time, `--cycle-time` takes precedence (rev 1.7.3 fix). |
+| `--cycle [SECONDS]` | optional int seconds ≥ 1 (flag = default 9) | off | Enter cycle mode automatically at startup; the first slide is the **oldest** settled image (R29, §5.7). The optional value sets the **initial cycle time** (R28); **combinable with `--cycle-time`** — when both give a time, `--cycle-time` takes precedence (rev 1.7.3 fix). Inert in single-file mode (R21) and `--print` mode (R12). |
 | `--poll` | float seconds, > 0 | off | Force polling mode with the given interval (R2). Also serves as the fallback interval when inotify is unavailable and this flag was given. |
 | `--max-dim` | int px ≥ 0 | `0` | Absolute cap on the **longer side** of the decoded image, in pixels. `0` (default) means no cap beyond the decode-target scaling (§7.1). |
 | `--fit` (synonym `--fit-window`) | `ratio` / `exact` / `off` | `ratio` | Window fit mode (R24, §5.6): how the window is sized to the first displayed image — `ratio`: the image's aspect ratio within the 80 % budget box (itself capped at the D15 COSMIC box, 1600×1200 logical px, until the upstream COSMIC clamping bug is fixed); `exact`: 1:1 logical pixels, capped at the screen minus the header; `off`: the D11 pre-image size only. Inert in `--print`/`--fullscreen`. |
@@ -224,8 +229,9 @@ it may be a `file://` URI (the desktop entry's `%U`, R20).
 
 - `--stable-ms` must be an integer ≥ 0; `--poll` a number > 0; `--max-dim` an
   integer ≥ 0; `--cycle-time` an integer ≥ 1 (R28); `--cycle` (with a value)
-  an integer ≥ 1; `--cycle` and `--cycle-time` are **mutually exclusive**
-  (either usage error → exit 2); `--fit` one of
+  an integer ≥ 1 (either → exit 2); when **both** `--cycle [SECONDS]` and
+  `--cycle-time` give a time, `--cycle-time` takes precedence — no error (rev 1.7.3
+  fix); `--fit` one of
   `ratio`/`exact`/`off` (any other value → exit 2).
 - `--extensions` must parse to a non-empty set of non-empty tokens; tokens containing `/` or
   starting with `.` are rejected.
@@ -262,10 +268,10 @@ it may be a `file://` URI (the desktop entry's `%U`, R20).
 
 With the window focused, in windowed and full-screen mode alike (bare keys; Shift is
 tolerated, so `Q`/`F` work too; any other modifier leaves the key unhandled;
-in single-file mode the movement keys `Left`/`Right`/`Home`/`End`/`p` and `c` have
-no observable effect, R21/R27):
+in single-file mode the movement keys `Left`/`Right`/`Home`/`End`/`p` and
+`c`/`space` have no observable effect, R21/R27/R31):
 
-In **cycle mode** (R27), every mode-selecting key — `Left`/`Right`/`Home`/`End`/`p`/`n` —
+In **cycle mode** (R27), every mode-selecting key — `Left`/`Right`/`Home`/`End`/`p`/`n`/`space` —
 **exits cycle mode first**, then applies the semantics below; `f`/`Esc`/`r`/
 double-click do not affect it; `Up`/`Down` adjust the cycle time (R28).
 
@@ -282,14 +288,16 @@ double-click do not affect it; `Up`/`Down` adjust the cycle time (R28).
 | `p` | **Pause:** pin whatever image is displayed, no movement attempt (R26, §5.5) — the pure freeze; the only key that pins without moving. No observable effect in manual mode, the image-gone state, or the waiting state. |
 | `n` | Return to the **newest** image and resume live following (R23, §5.5) — including out of the image-gone state. No-op when already in live mode. The **only** key that leaves manual mode. Exits cycle mode (R27). |
 | `c` | **Start cycle mode** — the slide show (R27, §5.7): from the currently displayed image, advance to the next newer settled image every cycle time, wrapping from the newest to the oldest. No-op in the idle state, in single-file mode (R21), and while already cycling. |
+| `space` | **Toggle cycle ↔ pause** (R31, §5.7): while not cycling it acts as `c` (start the slide show — overlay `cycle on: {N}s`); while cycling it acts as `p` (stop the cycle and pin the current slide — overlay `pause`). No-op in the idle state and in single-file mode (its dispatch is a no-op — no overlay). |
 | `Up` | **Increase the cycle time by 1 s** (R28, §5.7) — during or outside cycle mode; while cycling it **rescales the current interval** (elapsed time preserved, R28); no other effect. |
 | `Down` | **Decrease the cycle time by 1 s** (R28), minimum 1 s (no effect at the minimum); while cycling it rescales the current interval (R28). |
 | `r` | Re-fit the window to the **currently displayed** image per the `--fit` mode (R24, §5.6). No-op in `off` mode, in the waiting/idle/image-gone states, and in `--fullscreen`. |
 
-In **full screen** (R16) the header — the usual feedback for these keypresses — is
-hidden, so the **effective** keypresses `c`/`p`/`n`/`Up`/`Down` show a brief (1 s)
+The **effective** keypresses `c`/`p`/`n`/`Up`/`Down`/`space` show a brief (1 s)
 on-canvas overlay message — `cycle on: {N}s` / `pause` / `newest live image` /
-`cycle: {N}s` — while no overlay appears in windowed mode (R30, §5.8).
+`cycle: {N}s` — in windowed and full-screen modes alike (in full screen the
+header is hidden, R16; in windowed mode the header keeps its persistent
+status alongside the transient overlay, R30, §5.8).
 
 ### 4.5 Mouse (R19)
 
@@ -584,6 +592,14 @@ The **cycle list** is the navigation list (§5.5) — the settled candidates in
 i.e. decreasing index; an advance moves to the adjacent newer settled image,
 and from index 0 (newest) it **wraps** to the last entry (oldest).
 
+**The toggle (R31, rev 1.7.2).** `space` toggles between cycle and pause:
+while not cycling it enters cycle mode exactly as `c` (from the currently
+displayed image); while cycling it stops the cycle and pins the current
+slide exactly as `p` (manual mode). Pressing it again reverses — the cycle
+restarts at the currently displayed image. No new state: `space` is an alias
+for `c` or `p` chosen by the current mode, and it shows the R30 overlay of
+the dispatched action.
+
 **The anchor.** On every advance the target is computed from the **current**
 list and the **current** displayed version — the same re-derivation as
 `Right` in manual mode (§5.5): the anchor is the displayed version's own
@@ -670,12 +686,14 @@ and `r` are unaffected); `--print` is unaffected (it has no cycle state).
 `cycle_target(ordered, anchor_key, failed_versions) -> path|None` (§12.3):
 `None` when the list is empty or every candidate is a failed version.
 
-### 5.8 Full-screen keypress feedback (R30)
+### 5.8 Keypress feedback overlay (R30)
 
-In full screen there is no header, so the four feedback keypresses show a brief
-message on the canvas, visible for **1 second**: pale-yellow text at about
-2.5× the normal font size, centered horizontally with its bottom edge about
-**10% up from the bottom of the window**, on a **semi-transparent gray shade**
+The four feedback keypresses show a brief message on the canvas, visible for
+**1 second**, in **windowed and full-screen modes alike**: pale-yellow text at
+about 2.5× the normal font size, centered horizontally with its bottom edge
+about **10% up from the bottom of the canvas** (below the header bar in
+windowed mode; in full screen the canvas is the whole window), on a
+**semi-transparent gray shade**
 that locally tones down the image brightness behind and around the text so
 the message stays readable over any image (appearance per §12.7):
 
@@ -686,17 +704,20 @@ the message stays readable over any image (appearance per §12.7):
 | `n` (back to live following on the newest) | `newest live image` |
 | `Up` / `Down` (the cycle time changes) | `cycle: {N}s` |
 
-("{N}" is the current cycle time in seconds.)
+("{N}" is the current cycle time in seconds.) `space` (R31) shows the text
+of the action it dispatches — `cycle on: {N}s` (as `c`) or `pause` (as `p`);
+a no-op dispatch shows nothing.
 
 - **Effective** = the keypress effects the named change; the no-op rules of
   §4.4/§5.5/§5.7 decide — `c` while already cycling, in the idle state, or in
   single-file mode; `p` in manual mode, the image-gone state, or the waiting
   state; `n` when already in live mode; `Down` at the 1 s floor — show
   **nothing** (a feedback message for a no-op would be false feedback).
-- **Full-screen-only:** in windowed mode the header (R10 subtitle, the
-  `· cycle {N}s` indicator of R28) already shows the feedback; an overlay
-  there would double it. Whether the window is full screen at the moment of
-  the keypress decides.
+- **Both modes (pre-release amendment; `riview` 1.7.1):** in windowed mode
+  the header (R10 subtitle, the `· cycle {N}s` indicator of R28) keeps its
+  **persistent** status — the overlay is the **transient** confirmation, shown
+  in windowed and full-screen modes alike (the original no-doubling rationale
+  is retired by the spec owner).
 - **Timer:** one-shot, exactly 1 s (a named constant, main thread). A further
   feedback keypress within the 1 s replaces the text and restarts the timer
   (last wins); the previous timer is cancelled.
@@ -710,7 +731,8 @@ the message stays readable over any image (appearance per §12.7):
   show no overlay. `--print` mode has no window and is unaffected (R12).
 - Headless-testable: which text (or none) a keypress shows is a pure
   function of the keypress and the pre-press state (case 8k); the on-screen
-  surface (show, 1 s expiry, replace, dismiss-on-toggle) is manual case 37.
+  surface (show, 1 s expiry, replace, dismiss-on-toggle) is manual cases 37
+  (full screen) and 38 (windowed).
 
 ---
 
@@ -947,9 +969,10 @@ Headless cases (runnable in a plain shell, no display needed — `tests/test_riv
    through to the wrap; single-element list → the same element (no advance);
    empty list → `None`; every candidate failed → `None`.
 8j. **Cycle time (R28)** → `--cycle-time 0` / `--cycle-time -3` → exit 2;
-   `--cycle-time 9.5` → exit 2 (integer-only); default is 9 s; `--cycle`
-   `--cycle-time 3` → exit 2 (mutually exclusive); `--cycle 0` / `--cycle
-   2.5` → exit 2; the clamp
+   `--cycle-time 9.5` → exit 2 (integer-only); default is 9 s; `--cycle
+   --cycle-time 3` → starts in cycle mode at 3 s (combinable — rev 1.7.3
+   fix); `--cycle 5 --cycle-time 3` → 3 s (`--cycle-time` takes precedence); `--cycle 0`
+   / `--cycle 2.5` → exit 2; the clamp
    logic: `Up` adds 1 s (no upper bound), `Down` subtracts 1 s, floor 1 s
    (no effect at the floor); the rescale logic: 9 s with 2 s elapsed, `Down`
    ×2 → 7 s → the current slide's deadline moves to now+5 s (elapsed
@@ -957,16 +980,23 @@ Headless cases (runnable in a plain shell, no display needed — `tests/test_riv
    elapsed time (e.g. 8 s elapsed, `Down` to 2 s) moves the deadline to the
    past → advance at the next tick; outside cycle mode the keys change the
    stored value only (no deadline exists).
-8k. **Full-screen feedback overlay (R30, unit + fake window)** → the effective
+8k. **Keypress feedback overlay (R30, unit + fake window)** → the effective
    keypresses map to the overlay text with the current cycle time (`c` →
    `cycle on: {N}s`, `p` → `pause`, `n` → `newest live image`, `Up`/`Down` →
    `cycle: {N}s`); no-op keypresses show nothing (`c` while cycling, `n` in
    live mode, `p` in manual mode, `Down` at the 1 s floor); windowed mode shows
-   no overlay for any of the four; the overlay is armed for 1 s and then
+   the same overlays (pre-release amendment — the 10% margin is canvas-based
+   in both modes); the overlay is armed for 1 s and then
    hidden (fake timers); a second feedback keypress within the 1 s replaces
    the text and restarts the timer; a full-screen toggle dismisses an active
    overlay; the overlay does not touch the cycle deadline (the R28 clock
    invariant) and is not shown at startup.
+
+8l. **`space` cycle/pause toggle (R31, unit + fake window)** → `space` while
+   not cycling starts the cycle exactly as `c` (overlay `cycle on: {N}s`);
+   `space` while cycling stops the cycle and pins exactly as `p` (overlay
+   `pause`); a no-op dispatch (idle state, single-file mode) shows nothing;
+   the overlay text is the dispatched action's (R30).
 
 GUI cases (require a graphical session — run inside COSMIC; this workspace's shell has no X
 authority, so these are manual/semi-automated):
@@ -990,7 +1020,7 @@ authority, so these are manual/semi-automated):
 17. **Polling mode** → `--poll 0.5` repeats cases 10–12 with equivalent behaviour.
 18. **Fullscreen** → `--fullscreen` starts full-screen, image only (no header bar, no
     waiting text — just the black canvas and the image); window close exits 0.
-    (Keypress feedback in full screen: case 37, R30.)
+    (Keypress feedback: cases 37/38, R30.)
 19. **`--max-dim`** → a 4096 px source with `--max-dim 512` shows a ≤512 px decode (header
     dimensions confirm).
 20. **Directory delete + recreate** (inotify mode) → `rm -r out && mkdir out` and drop a new
@@ -1102,12 +1132,32 @@ authority, so these are manual/semi-automated):
    image`; `n` again (now live) → no overlay. `c` followed by `Up` within the
    1 s → the text is replaced and the visible lifetime restarts at ≈ 1 s
    (last wins). The cycle keeps advancing on schedule throughout — the
-   overlay neither resets nor shifts the clock (R28). `f` → windowed: no
-   further overlays (the header indicator is the feedback again) and an
-   active overlay is dismissed immediately. `--cycle --fullscreen` at startup
+   overlay neither resets nor shifts the clock (R28). `f` → windowed: an
+   active overlay is dismissed immediately, and the overlays continue on the
+   canvas below the header (case 38). `--cycle --fullscreen` at startup
    → no overlay at open. Single-file mode: `c`/`n`/`p` are no-ops → no
    overlay; `Up`/`Down` still show `cycle: {N}s` (the stored value changes,
    R28).
+
+38. **Windowed keypress feedback (R30, rev 1.7 pre-release amendment)** →
+   `riview out --cycle-time 3` (windowed) with ≥3 settled images: the same
+   four overlays (`c` → `cycle on: 3s`, `p` → `pause`, `n` → `newest live
+   image`, `Up`/`Down` → `cycle: {N}s`) on the canvas **below the header bar**
+   — pale-yellow on a semi-transparent gray shade, bottom center, its bottom
+   edge about 10% up from the canvas bottom — gone within ≈ 1 s; the header
+   keeps its persistent status (`· cycle Ns` marker, R10/R28) alongside the
+   transient overlay; same no-op rules (no overlay for no-ops); same
+   replace/restart within the 1 s; `f` (to full screen) dismisses an active
+   overlay immediately and the overlays continue on the now header-less
+   canvas. Nothing at startup (`--cycle` windowed opens without one).
+
+39. **`space` cycle/pause toggle (R31, rev 1.7.2)** → `riview out
+   --cycle-time 3` (windowed) with ≥3 settled images: `space` → `cycle on:
+   3s`, the slides advance every ≈ 3 s; `space` again → `pause`, the cycle
+   stops and the current slide is pinned (manual mode — `Left`/`Right` step
+   from it); `space` again → `cycle on: 3s`, the cycle restarts at the
+   currently shown image; `space` in single-file mode or the idle state does
+   nothing (no overlay).
 
 ---
 
@@ -1143,7 +1193,7 @@ final rev-1.6 amendment).
 | D16 | **Home/End jump (rev 1.4, R25):** `Home` → the oldest settled image, `End` → the newest settled image, both **pinning** the display (manual mode); `End` does **not** resume live following (`n` remains the live key); no-op when the target is already the displayed/pinned file (hence `End` in live mode is a no-op), in the waiting state, and in single-file/idle modes; both work from the image-gone state (recover the display, stay manual). | Confirmed by the spec owner (rev 1.4 request): "the additional keys `home` and `end` should move to the oldest and to the newest image (when in directory mode). `end` does not start the automatic mode, it just pins to the currently newest image." The already-displayed no-op — and hence the `End`-in-live-mode no-op — is the implementer's reading of "just pins to the currently newest image", chosen for consistency with R23's clamped-end no-op philosophy (no invisible live→manual mode change). **Superseded by D17 (rev 1.5):** the "already-displayed no-op" reading was replaced by the two-phase rule — a movement keypress always pins, including when the attempt makes no change. |
 | D17 | **Movement keys always pin; position-preserving image-gone; `p` pause (rev 1.5, R23/R25/R26):** every movement key is two-phase — attempt a movement over the settled list, then pin whatever is displayed (a failed attempt still pins; in live mode every movement key therefore exits live mode). The `Left`/`Right` anchor is where the displayed version sorts by `(mtime, path)` — virtual (last known mtime) in the image-gone state and mid-rewrite, so scanning continues after deleting the displayed file. `p` pins the display without moving. `n` is the only key that resumes live mode. | Confirmed by the spec owner: "movement key = try the movement (maybe it changes the image, or maybe it doesn't), and then pin whatever is displayed"; "if an image hasn't settled, it's not yet a candidate to be displayed, so the movement keys can't select it; no special clauses for this"; "we can also add a 'p' key (pause), that will simply pin whatever image is being displayed"; "with Image-gone, we still hold that path pinned together with its previous mtime … I can still right or left to the next image and keep scanning." Supersedes D16's "already-displayed no-op" reading. |
 | D18 | **Cycle mode / slide show (rev 1.6, R27/R28):** `c` enters a third display mode — the slide show: every **cycle time** (`--cycle-time`, integer seconds, min 1, default 9; `Up`/`Down` ±1 s at runtime, floor 1 s, rescaling the current interval — elapsed preserved) the display advances one *settled* image toward the newer end of the navigation list, wrapping newest→oldest. Live following (R3) is suspended while cycling; newly settled images join the list at the newest end and are picked up when the cycle reaches them (the cycle grows), deleted files drop out. The advance target is re-derived from the §5.5 anchor each tick (no stored index), so the list may grow/shrink underneath the cycle; failed decodes (R15) are skipped, never retried. Every mode-selecting key exits cycling first, then applies its normal semantics (two-phase → manual; `n` → live); display keys (`f`/`Esc`/`r`/double-click) do not affect it. | Per the spec owner's rev-1.6 request (slide show over the settled images, `c` to start, any navigation key to stop and fall into manual/live, `--cycle-time` default 9 s with `Up`/`Down` ±1 s down to 1 s). The re-derived-anchor choice follows the rev-1.5 philosophy (D17: "the anchor is re-derived … so files settling or leaving in the background never shift the display"). Detail assumptions A1–A9 confirmed as drafted in the rev-1.6 review; A10 **amended by the spec owner**: an `Up`/`Down` adjustment rescales the **current** interval — elapsed time preserved (remaining = new time − elapsed; a new time below the elapsed time advances at the next tick) — and every following interval uses the new full cycle time (worked example: 9 s with 2 s elapsed, `Down`×2 → remaining 5 s, next image a full 7 s). |
-| D19 | **`--cycle` at startup (rev 1.6, R29):** the flag `--cycle` arms cycle mode from process start (before any display) and selects the **oldest** settled candidate for the first display instead of the newest R3 would show; from there the cycle runs exactly as R27 (advance toward the newer end, wrap newest→oldest). `--cycle` takes an optional value — the initial cycle time in seconds — and is mutually exclusive with `--cycle-time`. | Per the spec owner's final rev-1.6 amendment ("a `--cycle` option that will automatically start cycle mode when the software starts. Preferably, it would start at the oldest image"), amended by the spec owner: "--cycle and --cycle-time should be mutually exclusive… --cycle should have an option value, in seconds, for the initial cycle time". Oldest-start is specified (the acceptable fallback — newest start, wrap on the first advance — was not needed: with the re-derived anchor the oldest is just a different first target). Inert in single-file mode (R21) and `--print` (R12). |
+| D19 | **`--cycle` at startup (rev 1.6, R29):** the flag `--cycle` arms cycle mode from process start (before any display) and selects the **oldest** settled candidate for the first display instead of the newest R3 would show; from there the cycle runs exactly as R27 (advance toward the newer end, wrap newest→oldest). `--cycle` takes an optional value — the initial cycle time in seconds — and is combinable with `--cycle-time` (when both give a time, `--cycle-time` takes precedence — rev 1.7.3 fix). | Per the spec owner's final rev-1.6 amendment ("a `--cycle` option that will automatically start cycle mode when the software starts. Preferably, it would start at the oldest image"), amended by the spec owner: "--cycle and --cycle-time should be mutually exclusive… --cycle should have an option value, in seconds, for the initial cycle time" — the mutual-exclusion amendment **retracted by the spec owner** (a confirmation mistake, rev 1.7.3): `--cycle` carries no interval of its own, so the combination is unambiguous; the rule is now that `--cycle-time` takes precedence when both give a time. Oldest-start is specified (the acceptable fallback — newest start, wrap on the first advance — was not needed: with the re-derived anchor the oldest is just a different first target). Inert in single-file mode (R21) and `--print` (R12). |
 
 ### 12.2 Deliverables
 
@@ -1407,8 +1457,9 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
   except the transient feedback overlay (R30, next bullet).
 - **Feedback overlay (R30, §5.8):** a `Gtk.Label` in the same `Gtk.Overlay`
   (bottom center: `halign=CENTER`, `valign=END`; the bottom margin = 10% of
-  the window height is computed at **show time** from the window's current
-  allocated height (`Gtk.Widget.get_height`) — no resize signal is tracked:
+  the **canvas** height is computed at **show time** from the canvas
+  container's (`Gtk.Overlay`) current allocated height (`get_height`) — no
+  resize signal is tracked:
   GTK4 has no window size-changed signal and a 1 s transient does not need
   live tracking; the two window signals tried first do not exist on this
   box's build — `window-handle-size-changed` needs a newer libadwaita,
@@ -1421,7 +1472,7 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
   `border-radius: 8px`, that tones down the image brightness where the
   message shows), hidden by default.  The key handler shows it (text per §5.8)
   only when a feedback keypress is
-  effective **and** the window is full-screened, and arms/restarts a 1 s
+  effective (windowed **or** full-screen mode), and arms/restarts a 1 s
   one-shot `GLib.timeout_add` hide (no-argument callback, §13.2); a further
   feedback keypress replaces the text and restarts the timer; `_set_fullscreen`
   hides it immediately; it is never shown at startup. Purely cosmetic — it
@@ -1502,12 +1553,17 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
   `interval_start_mono = next_advance_mono = now_mono + cycle_s` (first
   advance after a full interval), start the `CYCLE_CHECK_MS` (250 ms)
   deadline-check timeout, show the `· cycle {N}s` indicator.
+  `space` (R31): dispatch in the same handler — while cycling, the `p`
+  path (`_cycle_stop` + `_pause`); otherwise the `c` path (`_cycle_start`);
+  the overlay shows the dispatched action's text (R30).
   **Startup (`--cycle`, R29):** the flag sets `cycle_mode = True`,
   `start_oldest = True`, `pinned_path = None` at process start (before any
   display); the first tick selects the **oldest** settled candidate
   (`ordered[-1]`, §12.5), clears `start_oldest`, and from there on the cycle
   runs as above (first advance a full interval after the first display).
-  `cycle_s` is `--cycle`'s value or `--cycle-time` (validated in §4.2). `Up`/`Down` —
+  `cycle_s` is `--cycle-time`, else `--cycle`'s value, else the 9 s default
+  (validated in §4.2 — when both give a time, `--cycle-time` takes
+  precedence, rev 1.7.3). `Up`/`Down` —
   `on_cycle_adjust(±1)` (§12.5): `cycle_s` clamped to the 1 s floor, and
   while cycling the **current** interval is rescaled — the deadline becomes
   `now + (cycle_s − elapsed)` (elapsed preserved; a new time below the
@@ -1519,14 +1575,16 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
   and is disarmed on cycle exit and on window close. `--cycle-time` feeds
   the initial `cycle_s` (validated ≥ 1 in `validate()`, exit 2 otherwise).
 - **Feedback overlay (R30, §5.8):** after a feedback keypress (`c`/`p`/`n`/
-  `Up`/`Down`) has been processed, when the keypress was **effective** (the
-  named change happened — §5.8 mirrors the no-op rules) **and** the window is
-  full-screened, the handler sets the overlay label's text (`cycle on: {N}s` /
-  `pause` / `newest live image` / `cycle: {N}s`), shows it, and arms/restarts
-  the 1 s one-shot hide timeout (main thread, no-argument callback, §13.2).
-  No-op keypresses and windowed mode leave the label untouched; `_set_fullscreen`
-  (the `f`/`Esc`/double-click path) hides it immediately. The overlay touches
-  none of `cycle_mode`, `cycle_s`, or the deadline (cosmetic, R28).
+  `Up`/`Down`/`space` — the latter showing the text of its dispatched action,
+  R31) has been processed, when the keypress was **effective** (the named
+  change happened — §5.8 mirrors the no-op rules), the handler — in windowed
+  and full-screen modes alike — sets the overlay label's text (`cycle on:
+  {N}s` / `pause` / `newest live image` / `cycle: {N}s`), shows it, and
+  arms/restarts the 1 s one-shot hide timeout (main thread, no-argument
+  callback, §13.2). No-op keypresses leave the label untouched (both modes —
+  rev 1.7.1); `_set_fullscreen` (the `f`/`Esc`/double-click path) hides it
+  immediately. The overlay touches none of `cycle_mode`, `cycle_s`, or the
+  deadline (cosmetic, R28).
 - **Fit key (R24, §5.6):** `r`/`R` (same bare-key/Shift rules as R18) → `_refit()`:
   when a snapshot is on display, `fit_mode != "off"`, and the window is not
   full-screened, compute `fit_window(...)` from the snapshot's dimensions and
