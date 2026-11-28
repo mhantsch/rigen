@@ -333,7 +333,7 @@ class TestCliValidation(unittest.TestCase):
     def test_version(self):
         r = run_riview("--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("riview 1.8.1", r.stdout)
+        self.assertIn("riview 1.8.3", r.stdout)
 
     def test_missing_dir_exit3(self):
         r = run_riview("--print", self.dir + "/no-such-dir")
@@ -1004,6 +1004,10 @@ def make_fake_window(Window, **kw):
     # stubbed — the real measurement needs a display (manual case 42):
     w._info_label = _FakeInfoLabel()
     w._info_visible = False
+    # 1.8.3 reflow state (normally set in __init__):
+    w._info_poll_id = None
+    w._info_full_text = ""
+    w._info_layout_size = None
     w._info_wrap_chars = lambda px: max(8, px // 12)
     w._info_max_lines = lambda h: max(1, int(h * 0.5 / 24))
     w._info_elide = lambda text, n, px: text
@@ -3492,6 +3496,222 @@ class TestPromptInfo(unittest.TestCase):
         # The deferred reposition is a no-op once hidden:
         self._key(w, self.Gdk.KEY_i)  # hide
         self.assertFalse(self.Window._info_reposition(w))
+
+    # -- wrap width: letterboxed image (1.8.2, case 8o) ----------------
+    def test_wrap_px_image_wider_or_fitted(self):
+        # image >= canvas (window fitted to the image, or oversized in
+        # off mode) -> 0.8*canvas: the pre-patch rule, unchanged.
+        self.assertEqual(riview.info_wrap_px(1000, 1000), 800)
+        self.assertEqual(riview.info_wrap_px(1000, 1500), 800)
+        self.assertEqual(riview.info_wrap_px(1280, 1920), 1024)
+
+    def test_wrap_px_letterbox_hugs_image(self):
+        # rendered image in [62.5%, 100%) of the canvas -> 0.8*image
+        # (hugs the letterboxed image, not the window).
+        self.assertEqual(riview.info_wrap_px(1000, 700), 560)
+        self.assertEqual(riview.info_wrap_px(1000, 625), 500)  # boundary
+        self.assertEqual(riview.info_wrap_px(1280, 1000), 800)
+
+    def test_wrap_px_narrow_floor(self):
+        # rendered image < 62.5% of the canvas -> the 0.5*canvas floor.
+        self.assertEqual(riview.info_wrap_px(1000, 500), 500)
+        self.assertEqual(riview.info_wrap_px(1000, 100), 500)
+        self.assertEqual(riview.info_wrap_px(1280, 400), 640)
+        self.assertEqual(riview.info_wrap_px(0, 100), 0)
+
+    def test_letterbox_wrap_hugs_image_surface(self):
+        # canvas 1280, rendered image 1000 wide -> wrap 800 px (the
+        # pre-patch rule would have used 1024 px).
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w._dims = (1000, 750)
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.max_width_chars, 800 // 12)
+
+    def test_letterbox_narrow_floor_surface(self):
+        # rendered image 400 < 0.625*1280 = 800 -> floor 0.5*1280 =
+        # 640 px.
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w._dims = (400, 300)
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.max_width_chars, 640 // 12)
+
+    def test_no_image_falls_back_to_canvas_width(self):
+        # waiting / idle / image-gone: no displayed width -> 0.8*canvas
+        # (a stale _dims without a snapshot must not apply).
+        w = self._win()  # no snapshot
+        w._dims = (1000, 750)  # stale, from a previous image
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.max_width_chars, 1024 // 12)
+
+    def test_update_on_swap_reapplies_wrap(self):
+        # slide A (rendered 1000) -> slide B (rendered 400): the
+        # swap re-applies BOTH the text and the wrap width (1.8.2).
+        pa = self._png_prompt("a.png", "slide a prompt")
+        pb = self._png_prompt("b.png", "slide b prompt")
+        w = self._win(snapshot=self._snap(pa))
+        w._dims = (1000, 750)
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.max_width_chars, 800 // 12)
+        w.snapshot = self._snap(pb)  # a display change
+        w._dims = (400, 300)
+        self.Window._info_update(w)
+        self.assertEqual(w._info_label.text, "slide b prompt")
+        self.assertEqual(w._info_label.max_width_chars, 640 // 12)
+
+    def test_r_schedules_deferred_reposition_when_visible(self):
+        # an r re-fit can change the rendered image width -> while the
+        # overlay is visible, the deferred reposition is scheduled
+        # (the same mechanism as the full-screen toggle).
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w.fit_mode = "ratio"       # r is effective (not a no-op)
+        w._refit = lambda: None    # the re-fit itself is stubbed
+        self._key(w, self.Gdk.KEY_i)
+        from gi.repository import GLib  # the same module the handler uses
+        added = []
+        orig = GLib.timeout_add
+        GLib.timeout_add = lambda ms, fn: added.append((ms, fn)) or 0
+        try:
+            self.assertTrue(self._key(w, self.Gdk.KEY_r, 0))
+        finally:
+            GLib.timeout_add = orig
+        self.assertEqual(len(added), 1)
+        self.assertEqual(added[0][0], 250)
+        self.assertIs(added[0][1].__self__, w)  # the bound _info_reposition
+
+    def test_r_no_reposition_when_hidden_or_refit_noop(self):
+        # overlay hidden -> nothing scheduled; a no-op re-fit (off
+        # mode) with the overlay visible -> nothing scheduled.
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w.fit_mode = "ratio"
+        w._refit = lambda: None
+        off = self._win(snapshot=self._snap(p))  # fit_mode off (default)
+        self._key(off, self.Gdk.KEY_i)
+        from gi.repository import GLib  # the same module the handler uses
+        added = []
+        orig = GLib.timeout_add
+        GLib.timeout_add = lambda ms, fn: added.append((ms, fn)) or 0
+        try:
+            self.assertTrue(self._key(w, self.Gdk.KEY_r, 0))  # hidden
+            self.assertTrue(self._key(off, self.Gdk.KEY_r, 0))  # no-op refit
+        finally:
+            GLib.timeout_add = orig
+        self.assertEqual(added, [])
+
+    # -- reflow on windowed resize (1.8.3, case 8p) ---------------------
+    def test_show_installs_poll_hide_removes(self):
+        # the observation exists only while the overlay is visible —
+        # installed as a 50 ms GLib timeout (the proven convention),
+        # removed via GLib.source_remove on hide.
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        from gi.repository import GLib
+        added, removed = [], []
+        orig_add = GLib.timeout_add
+        orig_remove = GLib.source_remove
+        GLib.timeout_add = lambda ms, fn: added.append((ms, fn)) or "poll"
+        GLib.source_remove = lambda sid: removed.append(sid)
+        try:
+            self._key(w, self.Gdk.KEY_i)          # show: install
+            self.assertEqual(added, [(50, w._info_poll)])
+            self.assertEqual(w._info_poll_id, "poll")
+            self._key(w, self.Gdk.KEY_i)          # hide: remove
+            self.assertEqual(removed, ["poll"])
+        finally:
+            GLib.timeout_add = orig_add
+            GLib.source_remove = orig_remove
+        self.assertIsNone(w._info_poll_id)
+
+    def test_poll_noop_when_size_unchanged(self):
+        # unchanged canvas size -> NO label writes (two integer reads
+        # are the whole cost of a poll period).
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w._dims = (1000, 750)
+        self._key(w, self.Gdk.KEY_i)
+        calls = list(w._info_label.calls)
+        self.assertTrue(w._info_poll())  # keep the source
+        self.assertEqual(w._info_label.calls, calls)
+
+    def test_poll_reflows_on_resize(self):
+        # canvas 1280 -> 640: wrap + bottom margin re-applied from the
+        # cached text (image wider than canvas -> 0.8*canvas = 512 px).
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w._dims = (1000, 750)
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.max_width_chars, 800 // 12)
+        w._canvas.w = 640  # a windowed resize
+        self.assertTrue(w._info_poll())
+        self.assertEqual(w._info_label.max_width_chars, 512 // 12)
+        self.assertEqual(w._info_label.margin_bottom, int(720 * 0.22))
+        self.assertEqual(w._info_label.text, "a fox in the rain")
+        self.assertEqual(w._info_layout_size, (640, 720))
+
+    def test_poll_does_not_extract(self):
+        # a resize changes no file -> the extraction is NOT called on
+        # the poll path (case 8p).
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w._dims = (1000, 750)
+        calls = []
+        orig = riview.extract_prompt
+        riview.extract_prompt = lambda *a, **k: calls.append(1) or "x"
+        try:
+            self._key(w, self.Gdk.KEY_i)
+            self.assertEqual(len(calls), 1)   # the show extraction
+            w._canvas.w = 512                 # a windowed resize
+            w._info_poll()
+            self.assertEqual(len(calls), 1)   # no re-extraction
+        finally:
+            riview.extract_prompt = orig
+
+    def test_poll_reflows_from_cached_full_text(self):
+        # the poll re-elides from the cached UNELIDED text, so a grow
+        # de-elides (the label currently holds the elided version).
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w._info_full_text = "the full unelided prompt text"
+        w._info_label.text = "the full uneli…"  # an elided state
+        w._info_layout_size = (1280, 720)
+        w._canvas.w = 1920  # a grow
+        self.assertTrue(w._info_poll())
+        self.assertEqual(w._info_label.text, "the full unelided prompt text")
+
+    def test_poll_survives_fullscreen_toggle(self):
+        # the overlay (and its observation) survives f/Esc — a full-
+        # screen toggle does not touch the poll source; no double-
+        # install, one removal on hide.
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        w.fullscreen = lambda: None
+        w.unfullscreen = lambda: None
+        from gi.repository import GLib
+        added, removed = [], []
+        orig_add = GLib.timeout_add
+        orig_remove = GLib.source_remove
+        GLib.timeout_add = lambda ms, fn: added.append((ms, fn)) or "poll"
+        GLib.source_remove = lambda sid: removed.append(sid)
+        try:
+            self._key(w, self.Gdk.KEY_i)
+            self.assertEqual(added, [(50, w._info_poll)])
+            self.Window._set_fullscreen(w, True)
+            self.assertTrue(w._info_visible)
+            self.assertEqual(w._info_poll_id, "poll")
+            # one poll install (the fullscreen 250 ms reposition
+            # timeout is a separate, expected source)
+            self.assertEqual([a for a in added if a[0] == 50],
+                             [(50, w._info_poll)])
+            self.Window._set_fullscreen(w, False)
+            self.assertEqual(w._info_poll_id, "poll")
+            self._key(w, self.Gdk.KEY_i)  # hide removes it once
+            self.assertEqual(removed, ["poll"])
+        finally:
+            GLib.timeout_add = orig_add
+            GLib.source_remove = orig_remove
 
 
 class TestPromptCopy(unittest.TestCase):

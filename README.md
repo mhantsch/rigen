@@ -194,12 +194,17 @@ as usual, so the help overlay and the feedback overlay never appear at the
 same time (1.7.5). `i` shows a **prompt information overlay**: the
 generation prompt embedded in the currently displayed image (PNG text
 chunks, JPEG/WebP EXIF `UserComment`) as pale-yellow text, centered,
-word-wrapped to 80% of the canvas width, its bottom edge about 22% up from
-the canvas bottom; it is shown at 1.5× the default font size, persists
+word-wrapped to 80% of the image's rendered width on the canvas (an
+image wider than the window: 80% of the canvas; a letterboxed image
+narrower than 62.5% of the canvas: a 50%-of-canvas floor — 1.8.2), its
+bottom edge about 22% up from the canvas bottom; it is shown at 1.5× the
+default font size, and persists
 until `i` is pressed again, and refreshes on every display change (a file
 without a prompt shows `no information`); a very long prompt is elided once
-it exceeds 50% of the canvas height; `f`/`Esc`/double-click reposition it
-on the new canvas without dismissing it; like the help overlay, each
+it exceeds 50% of the canvas height; `f`/`Esc`/double-click and `r` (re-fit)
+reposition it on the new canvas without dismissing it; a windowed window
+resize (drag) reflows it live while it is shown (1.8.3); like the help
+overlay, each
 dismisses the other (they never appear together), and `i` shows no 1 s
 feedback overlay of its own (1.8.0). `Ctrl+C` (a hidden feature — not in
 the help overlay) copies the currently displayed image's prompt — the

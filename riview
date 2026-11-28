@@ -20,7 +20,12 @@ the prompt information overlay — the generation prompt embedded in the
 displayed image (or `no information`) — persistent until i again,
 refreshed on every display change (R33, rev 1.8). Ctrl+C copies the
 displayed image's prompt to the clipboard — a hidden feature with the
-1 s `prompt copied` overlay on an effective copy (R34, rev 1.8.1). On the
+1 s `prompt copied` overlay on an effective copy (R34, rev 1.8.1).
+With the window wider than the image the prompt column hugs the image
+— 80 % of its rendered width, capped at 80 % of the window, floored at
+50 % of the window — and r repositions the overlay while it is visible
+(1.8.2 patch). A windowed window resize (drag) reflows the overlay live
+while it is visible (1.8.3). On the
 first displayed load the window fits the image (--fit ratio/exact/off)
 and r re-fits on demand (R24).
 
@@ -46,7 +51,7 @@ import time
 import urllib.parse
 import zlib
 
-VERSION = "1.8.1"
+VERSION = "1.8.3"
 
 _GTK_LIB = None  # R34: ctypes handle to libgtk-4 (see _gtk_lib)
 
@@ -96,7 +101,9 @@ CYCLE_CHECK_MS = 250   # R27/§12.9: cycle-deadline check period (main thread)
 FEEDBACK_MS = 1000     # R30: keypress-overlay lifetime, ms
 FEEDBACK_BOTTOM_FRAC = 0.10  # R30: overlay bottom edge, fraction of canvas height
 INFO_BOTTOM_FRAC = 0.22    # R33: info overlay bottom edge, fraction of canvas height
-INFO_WRAP_FRAC = 0.80      # R33: info overlay wrap width, fraction of canvas width
+INFO_WRAP_FRAC = 0.80      # R33: info overlay wrap width, fraction of the rendered image width (capped at canvas)
+INFO_FLOOR_FRAC = 0.50     # R33 (1.8.2): info overlay wrap floor, fraction of canvas width
+INFO_POLL_MS = 50          # R33 (1.8.3): windowed-resize observation period (GLib timeout)
 INFO_MAX_HEIGHT_FRAC = 0.50  # R33: info overlay height budget, fraction
 PROMPT_READ_BOUND = 8 * 1024 * 1024  # R33: extraction read bound (bytes)
 NO_INFO_TEXT = "no information"  # R33: the fallback overlay text
@@ -306,6 +313,22 @@ def _webp_exif_payload(data):
             return body
         off += 8 + ln + (ln & 1)
     return None
+
+
+def info_wrap_px(canvas_w, image_w):
+    """R33 1.8.2 (§5.10, case 8o): the prompt overlay's wrap width in
+    px — `min(0.8·canvas, max(0.8·image, 0.5·canvas))`. The column
+    hugs the rendered image width (a letterboxed window: the text no
+    longer runs across the letterbox):
+      - image ≥ canvas (window fitted to the image, oversized in
+        `off` mode) → 0.8·canvas — the pre-patch rule, unchanged;
+      - rendered image in [62.5 %, 100 %] of the canvas →
+        0.8·image (hugs the image);
+      - rendered image < 62.5 % of the canvas → 0.5·canvas (floor).
+    Pure (case 8o)."""
+    return max(0, int(min(canvas_w * INFO_WRAP_FRAC,
+                          max(image_w * INFO_WRAP_FRAC,
+                              canvas_w * INFO_FLOOR_FRAC))))
 
 
 def extract_prompt(path, bound=PROMPT_READ_BOUND):
@@ -1629,6 +1652,17 @@ def _gui_classes():
             self._info_label.set_wrap_mode(Pango.WrapMode.WORD)
             self._info_label.set_visible(False)
             self._info_visible = False
+            # 1.8.3: live reflow on windowed resize — the periodic
+            # size observation, installed only while visible (zero
+            # cost when hidden; GTK4 has no resize signal — the R30
+            # constraint). A GLib timeout, not a frame-clock tick: this
+            # PyGObject invokes tick callbacks with a non-standard
+            # argument count (§13.2), and the zero-argument timeout
+            # convention is the one proven throughout this program
+            # (cycle tick, R30 timer, deferred reposition; §12.7):
+            self._info_poll_id = None
+            self._info_full_text = ""   # cached extracted text, UNELIDED
+            self._info_layout_size = None  # last (canvas_w, canvas_h) applied
             overlay.add_overlay(self._info_label)
 
             # -- canvas double-click: toggle full screen (R19) --------------
@@ -2056,13 +2090,22 @@ def _gui_classes():
             self._info_update()
             self._info_label.set_visible(True)
             self._info_visible = True
+            # 1.8.3: live reflow on windowed resize while visible
+            # (zero cost when hidden — removed in _hide_info).
+            if self._info_poll_id is None:
+                self._info_poll_id = GLib.timeout_add(
+                    INFO_POLL_MS, self._info_poll)
 
         def _hide_info(self):
             """R33 (§5.10): hide the prompt information overlay — i
             again (toggle) or on shutdown. No state is remembered: a
-            later h/? does not re-show it, and vice versa."""
+            later h/? does not re-show it, and vice versa. 1.8.3:
+            also removes the periodic reflow observation."""
             self._info_label.set_visible(False)
             self._info_visible = False
+            if self._info_poll_id is not None:
+                GLib.source_remove(self._info_poll_id)
+                self._info_poll_id = None
 
         def _info_text(self):
             """R33 (§5.10): the overlay text for the currently
@@ -2115,29 +2158,74 @@ def _gui_classes():
                     hi = mid - 1
             return text[:lo] + "\u2026"
 
-        def _info_update(self):
-            """R33 (§5.10/§12.7): (re)extract + (re)position the
-            overlay — on show (i), on every display change while
-            visible (update-on-swap), and after a full-screen toggle
-            (deferred — _set_fullscreen). Position, wrap, and elision
-            are computed from the canvas container's current allocated
-            size (no resize signal is tracked — §12.7)."""
+        def _info_apply_layout(self, text):
+            """R33 1.8.3 (§5.10/§12.7): the LAYOUT half of the
+            overlay — wrap width, elision, bottom margin — applied to
+            `text` (the cached full extracted text, unelided, so a
+            window GROW de-elides) from the canvas container's current
+            allocated size and the rendered image width (1.8.2 —
+            info_wrap_px, case 8o). No extraction. Called by
+            _info_update (show / display change / image-gone) and by
+            _info_poll (windowed resize: the size changed, the text
+            did not)."""
             canvas_w = self._canvas.get_width()
             canvas_h = self._canvas.get_height()
-            wrap_px = max(0, int(canvas_w * INFO_WRAP_FRAC))
+            # 1.8.2: the wrap follows the rendered image width — the
+            # displayed pixbuf's on-canvas extent (self._dims), not
+            # the window. No image displayed (waiting / idle /
+            # image-gone → `no information`) falls back to the canvas
+            # width; a stale _dims without a snapshot must not apply.
+            image_w = (self._dims[0] if self.snapshot is not None
+                       and self._dims is not None else canvas_w)
+            wrap_px = info_wrap_px(canvas_w, image_w)
             self._info_label.set_max_width_chars(
                 self._info_wrap_chars(wrap_px))
             self._info_label.set_text(self._info_elide(
-                self._info_text(), self._info_max_lines(canvas_h),
-                wrap_px))
+                text, self._info_max_lines(canvas_h), wrap_px))
             self._info_label.set_margin_bottom(
                 int(canvas_h * INFO_BOTTOM_FRAC))
+            self._info_layout_size = (canvas_w, canvas_h)
+
+        def _info_update(self):
+            """R33 (§5.10/§12.7): (re)extract + (re)layout the
+            overlay — on show (i), on every display change while
+            visible (update-on-swap), after a full-screen toggle
+            (deferred — _set_fullscreen), and after an r re-fit while
+            visible (deferred — 1.8.2). The extraction (the bounded
+            file read, §12.11) runs HERE — and only here: a windowed
+            resize (1.8.3) re-runs the layout half (_info_poll →
+            _info_apply_layout) from the cached full text instead."""
+            text = self._info_text()
+            self._info_full_text = text
+            self._info_apply_layout(text)
+
+        def _info_poll(self):
+            """R33 1.8.3 (§5.10/§12.7): the windowed-resize
+            observation while the overlay is visible — GTK4 has no
+            resize signal (the R30 constraint), so a 50 ms timeout
+            reads the canvas's allocated size and, on change,
+            re-applies the layout from the cached full text (no
+            extraction — a resize changes no file; case 8p). A resize
+            always forces a redraw, so the reflow follows the drag
+            within one poll period (imperceptible). The frame-clock
+            tick was the original 1.8.3 mechanism, but this PyGObject
+            invokes tick callbacks with a non-standard argument count
+            (a TypeError on the first frame — the §13.2 convention
+            family); the zero-argument timeout convention is the one
+            proven throughout this program. Zero-argument + True
+            return keeps the source — it is removed on hide/shutdown
+            via GLib.source_remove (§13.2)."""
+            size = (self._canvas.get_width(), self._canvas.get_height())
+            if size != self._info_layout_size:
+                self._info_apply_layout(self._info_full_text)
+            return True
 
         def _info_reposition(self):
             """R33: one-shot deferred reposition after a full-screen
-            toggle — the new canvas dimensions land only after the
-            toggle (no resize signal; §12.7). No-argument + False
-            return — the GLib timeout contract (§13.2)."""
+            toggle or an r re-fit (1.8.2) — the new canvas dimensions
+            land only after the change (no resize signal; §12.7).
+            No-argument + False return — the GLib timeout contract
+            (§13.2)."""
             if self._info_visible:
                 self._info_update()
             return False
@@ -2552,6 +2640,14 @@ def _gui_classes():
                 return True
             if keyval in (Gdk.KEY_r, Gdk.KEY_R):
                 self._refit()  # display key: cycle mode keeps running
+                # R33 (1.8.2): a re-fit can change the rendered image
+                # width (letterbox) — reposition the overlay while
+                # visible, once the new canvas dimensions settle (the
+                # same deferred mechanism as the full-screen toggle).
+                if (self._info_visible and self.fit_mode != "off"
+                        and not self.fullscreen_mode
+                        and self.snapshot is not None):
+                    GLib.timeout_add(250, self._info_reposition)
                 return True
             if keyval in (Gdk.KEY_i, Gdk.KEY_I):
                 # R33 (§5.10): toggle the prompt information overlay —
