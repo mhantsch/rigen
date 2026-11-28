@@ -191,7 +191,22 @@ mode added in 1.7.1). `h` (or `?`) shows a short keyboard help overlay,
 centered on the canvas at a normal font size; it stays on screen until the
 next keypress, which dismisses it and — if the key is bound — executes it
 as usual, so the help overlay and the feedback overlay never appear at the
-same time (1.7.5). If the
+same time (1.7.5). `i` shows a **prompt information overlay**: the
+generation prompt embedded in the currently displayed image (PNG text
+chunks, JPEG/WebP EXIF `UserComment`) as pale-yellow text, centered,
+word-wrapped to 80% of the canvas width, its bottom edge about 22% up from
+the canvas bottom; it is shown at 1.5× the default font size, persists
+until `i` is pressed again, and refreshes on every display change (a file
+without a prompt shows `no information`); a very long prompt is elided once
+it exceeds 50% of the canvas height; `f`/`Esc`/double-click reposition it
+on the new canvas without dismissing it; like the help overlay, each
+dismisses the other (they never appear together), and `i` shows no 1 s
+feedback overlay of its own (1.8.0). `Ctrl+C` (a hidden feature — not in
+the help overlay) copies the currently displayed image's prompt — the
+same text `i` shows — to the clipboard, with the 1 s `prompt copied`
+overlay on an effective copy; with nothing to copy (no prompt, no
+displayed image) it does nothing; `Ctrl+C` in the terminal still quits
+(1.8.1). If the
 pinned file is deleted or renamed away the canvas goes black with a message;
 `Left`/`Right` keep scanning from where the image was (the pin remembers its
 mtime), and the display restores itself if the file reappears. `r` re-fits the
@@ -218,4 +233,4 @@ python3 tests/test_riview.py -v     # riview (selection/settle logic + headless 
 The suites run against `tests/mock_lemond.py` (a fake `lemond`), `tests/fake_lemonade`
 (a fake `lemonade` CLI), and (for riview) a real GLib main loop in headless mode;
 no GPU is required. The riview GUI surface itself is covered by the manual cases in
-`RIVIEW-SW-SPEC-AND-DESIGN.md` §11 (9–37).
+`RIVIEW-SW-SPEC-AND-DESIGN.md` §11 (9–43).

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Headless test suite for riview (spec §11, cases 1–8k).
+"""Headless test suite for riview (spec §11, cases 1–8n).
 
 No display required: exercises the pure selection/settle/navigation/
 fit-geometry layer with fake clocks, `--print` mode, CLI validation,
 desktop install, and launch-context detection via subprocess, plus
-headless integration of the watcher/decoder plumbing and the
-keyboard/mouse input logic (§11 cases 9–37 are the manual GUI cases).
+headless integration of the watcher/decoder plumbing, the
+keyboard/mouse input logic, prompt extraction, and the prompt-copy
+seam (§11 cases 9–43 are the manual GUI cases).
 
 Run:  python3 tests/test_riview.py -v
 """
@@ -15,11 +16,13 @@ import importlib.machinery
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RIVIEW = os.path.normpath(os.path.join(HERE, "..", "riview"))
@@ -330,7 +333,7 @@ class TestCliValidation(unittest.TestCase):
     def test_version(self):
         r = run_riview("--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("riview 1.7.5", r.stdout)
+        self.assertIn("riview 1.8.1", r.stdout)
 
     def test_missing_dir_exit3(self):
         r = run_riview("--print", self.dir + "/no-such-dir")
@@ -712,6 +715,8 @@ class TestInputShortcuts(unittest.TestCase):
         w.close = lambda: w.calls.append("close")
         w._set_fullscreen = lambda on: w.calls.append(f"fs:{on}")
         w._help_visible = False  # R32 (rev 1.7.5): help dismiss path
+        w._info_visible = False  # R33 (rev 1.8): info overlay toggle
+        w._info_label = _FakeInfoLabel()
         return w
 
     def _key(self, w, keyval, *mods):
@@ -799,6 +804,50 @@ class TestInputShortcuts(unittest.TestCase):
         self.assertFalse(self.App._on_signal(app, signal.SIGTERM))
         self.assertEqual(len(called), 2)
 
+    def test_on_signal_zero_arg_call(self):
+        # This GLib/PyGObject invokes the unix_signal_add closure with
+        # NO arguments (user_data None) — the signature must accept the
+        # zero-arg call (§13.2; §11 case 22). The original required-
+        # signum form TypeErrored on the first terminal ^C and the
+        # one-shot source was consumed, so only the second press exited.
+        app = self.App.__new__(self.App)
+        called = []
+        app.quit = lambda: called.append(1)
+        self.assertFalse(self.App._on_signal(app))
+        self.assertEqual(called, [1])
+
+    def test_unix_signal_add_quit_flow(self):
+        # End-to-end with the real GLib (no display needed):
+        # unix_signal_add + bounded MainLoop + self-sent SIGUSR1.
+        # The closure must run to completion (quit recorded). A hard
+        # 3 s bail keeps the test from ever hanging if the convention
+        # or the flow regresses (§13.2; §11 case 22 mechanism).
+        import gi
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+        loop = GLib.MainLoop()
+        quit_calls = []
+
+        def cb(signum=None):
+            quit_calls.append(1)
+            loop.quit()  # fast path; the 3 s bail is the safety net
+            return False
+
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, cb)
+
+        def arm():
+            os.kill(os.getpid(), signal.SIGUSR1)
+            return False
+
+        def bail():
+            loop.quit()
+            return False
+
+        GLib.timeout_add(100, arm)
+        GLib.timeout_add(3000, bail)
+        loop.run()
+        self.assertEqual(quit_calls, [1])
+
 
 class _Rec:
     """Record every method call (stand-in for a GTK widget in fakes)."""
@@ -845,13 +894,46 @@ class _FakeFeedbackLabel:
 
 class _FakeCanvas:
     """Stand-in for the canvas container (the Gtk.Overlay below the
-    header bar): only get_height() matters (R30's show-time margin, §12.7)."""
+    header bar): only get_height() / get_width() matter (R30's show-time
+    margin; R33's show-time wrap/position — §12.7)."""
 
-    def __init__(self, h=720):
+    def __init__(self, h=720, w=1280):
         self.h = h
+        self.w = w
 
     def get_height(self):
         return self.h
+
+    def get_width(self):
+        return self.w
+
+
+class _FakeInfoLabel:
+    """Stand-in for the R33 prompt-info Gtk.Label: real .text/.visible
+    state, wrap/margin values recorded (case 42's headless half)."""
+
+    def __init__(self):
+        self.text = ""
+        self.visible = False
+        self.max_width_chars = None
+        self.margin_bottom = None
+        self.calls = []
+
+    def set_max_width_chars(self, n):
+        self.max_width_chars = n
+        self.calls.append(("set_max_width_chars", (n,)))
+
+    def set_text(self, text):
+        self.text = text
+        self.calls.append(("set_text", (text,)))
+
+    def set_margin_bottom(self, px):
+        self.margin_bottom = px
+        self.calls.append(("set_margin_bottom", (px,)))
+
+    def set_visible(self, v):
+        self.visible = v
+        self.calls.append(("set_visible", (v,)))
 
 
 class _FakeDecoder:
@@ -917,6 +999,17 @@ def make_fake_window(Window, **kw):
     # Keyboard help (rev 1.7.5, R32): label + visibility flag:
     w._help_label = _FakeFeedbackLabel()
     w._help_visible = False
+    # Prompt information (rev 1.8, R33): label + visibility flag; the
+    # Pango metric seams (wrap chars / line budget / elision) are
+    # stubbed — the real measurement needs a display (manual case 42):
+    w._info_label = _FakeInfoLabel()
+    w._info_visible = False
+    w._info_wrap_chars = lambda px: max(8, px // 12)
+    w._info_max_lines = lambda h: max(1, int(h * 0.5 / 24))
+    w._info_elide = lambda text, n, px: text
+    # Prompt copy (rev 1.8.1, R34): the clipboard seam, recorded:
+    w._clipboard = []
+    w._clipboard_set = lambda text: w._clipboard.append(text)
     w.header = _Rec()
     for k, v in kw.items():
         setattr(w, k, v)
@@ -2903,12 +2996,15 @@ class TestKeyboardHelp(unittest.TestCase):
                 if a[0] == "set_text"]
 
     def test_help_text_matches_spec(self):
-        # Normative strings (spec §5.9): 12 lines, exact frame.
+        # Normative strings (spec §5.9): 13 lines — `Keys` header +
+        # 12 key lines (the R33 `i` line, rev 1.8) — exact frame.
         lines = riview.HELP_TEXT.split("\n")
-        self.assertEqual(len(lines), 12)
+        self.assertEqual(len(lines), 13)
         self.assertEqual(lines[0], "Keys")
         self.assertEqual(
             lines[1], "  Left / Right     display older / newer image")
+        self.assertEqual(
+            lines[-2], "  i                show prompt information")
         self.assertEqual(lines[-1], "  q                quit")
 
     def test_h_shows_help_no_feedback(self):
@@ -2996,6 +3092,582 @@ class TestKeyboardHelp(unittest.TestCase):
         self.assertEqual(w._cycle_tick_id, "tick")
         self._key(w, self.Gdk.KEY_a)  # unbound key dismisses too
         self.assertFalse(w._help_visible)
+
+
+# ---------------------------------------------------------------------------
+# R33 (rev 1.8): prompt extraction — spec §11 case 8m (pure unit: the
+# extracted prompt, or "not found", is a pure function of the file's
+# bytes; no display required). Fixture PNG / JPEG / WebP built in-test;
+# the algorithm is spec §12.11.
+# ---------------------------------------------------------------------------
+
+def _pc_chunk(typ, body):
+    """A raw PNG chunk (length + type + body + CRC)."""
+    return (struct.pack(">I", len(body)) + typ + body
+            + struct.pack(">I", zlib.crc32(typ + body) & 0xffffffff))
+
+
+def _pc_png(*chunks):
+    return b"\x89PNG\r\n\x1a\n" + b"".join(chunks) + _pc_chunk(b"IEND", b"")
+
+
+def _pc_ihdr(w=1, h=1):
+    return _pc_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+
+
+def _pc_tiff_uc(text, unicode=False, endian=b"II"):
+    """A minimal TIFF (byte-order marker first) whose single IFD holds
+    only UserComment (0x9286), CIPA-padded."""
+    e = "<" if endian == b"II" else ">"
+    if unicode:
+        raw = b"Unicode\x00\x00\x00" + text.encode("utf-16-le")
+    else:
+        raw = b"ASCII\x00\x00\x00\x00" + text.encode("ascii")
+    raw += b"\x00" * (-len(raw) % 4)  # CIPA: pad to 4 bytes
+    if len(raw) <= 4:
+        val = raw.ljust(4, b"\x00")
+    else:
+        val = struct.pack(e + "I", 26)  # data follows the 18-byte IFD
+    ifd = (struct.pack(e + "H", 1)                       # 1 entry
+           + struct.pack(e + "HHI", 0x9286, 2, len(raw)) # tag/type/count
+           + val
+           + struct.pack(e + "I", 0))                    # next IFD
+    return (endian + struct.pack(e + "H", 42)
+            + struct.pack(e + "I", 8) + ifd
+            + (raw if len(raw) > 4 else b""))
+
+
+def _pc_jpeg_exif(tiff):
+    seg = b"Exif\x00\x00" + tiff
+    return (b"\xff\xd8" + b"\xff\xe1" + struct.pack(">H", len(seg) + 2)
+            + seg + b"\xff\xd9")
+
+
+def _pc_webp_exif(tiff):
+    body = b"Exif\x00\x00" + tiff
+    if len(body) & 1:
+        body += b"\x00"  # RIFF chunks are word-aligned
+    chunk = b"EXIF" + struct.pack("<I", len(body)) + body
+    return b"RIFF" + struct.pack("<I", 4 + len(chunk)) + b"WEBP" + chunk
+
+
+class TestPromptExtraction(unittest.TestCase):
+    """rev 1.8 (R33): prompt extraction, spec §11 case 8m — fixture PNG
+    text chunks (tEXt / zTXt / iTXt, key set, SDCPP metadata split),
+    JPEG / WebP EXIF UserComment, no-prompt / unknown-format / missing
+    file, and the 8 MiB read bound (via the bound= seam)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="riview-prompt-")
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _f(self, name, data):
+        p = os.path.join(self.d, name)
+        with open(p, "wb") as fh:
+            fh.write(data)
+        return p
+
+    # -- PNG text chunks --------------------------------------------------
+    def test_png_text_single_line(self):
+        p = self._f("a.png", _pc_png(_pc_ihdr(), _pc_chunk(
+            b"tEXt", b"parameters\x00a fox in the rain")))
+        self.assertEqual(riview.extract_prompt(p), "a fox in the rain")
+
+    def test_png_text_metadata_split(self):
+        val = ("a fox in the rain\n"
+               "a second line\n"
+               "Steps: 4, CFG scale: 1.0, Seed: 42, Size: 256x256")
+        p = self._f("b.png", _pc_png(_pc_ihdr(), _pc_chunk(
+            b"tEXt", b"parameters\x00" + val.encode())))
+        self.assertEqual(riview.extract_prompt(p),
+                         "a fox in the rain\na second line")
+
+    def test_png_first_match_wins(self):
+        p = self._f("c.png", _pc_png(
+            _pc_ihdr(),
+            _pc_chunk(b"tEXt", b"Description\x00not a prompt"),
+            _pc_chunk(b"tEXt", b"parameters\x00the prompt"),
+            _pc_chunk(b"tEXt", b"Comment\x00the other")))
+        self.assertEqual(riview.extract_prompt(p), "the prompt")
+
+    def test_png_key_variants(self):
+        for key in ("prompt", "Prompt", "Comment"):
+            p = self._f("k.png", _pc_png(_pc_ihdr(), _pc_chunk(
+                b"tEXt", key.encode() + b"\x00the prompt")))
+            self.assertEqual(riview.extract_prompt(p), "the prompt")
+
+    def test_png_ztxt_compressed(self):
+        body = b"parameters\x00\x00" + zlib.compress(b"compressed prompt")
+        p = self._f("z.png", _pc_png(_pc_ihdr(), _pc_chunk(b"zTXt", body)))
+        self.assertEqual(riview.extract_prompt(p), "compressed prompt")
+
+    def test_png_itxt(self):
+        body = b"en\x00\x00parameters\x00itxt prompt"
+        p = self._f("it.png", _pc_png(_pc_ihdr(), _pc_chunk(b"iTXt", body)))
+        self.assertEqual(riview.extract_prompt(p), "itxt prompt")
+
+    def test_png_no_prompt(self):
+        p = self._f("n.png", _pc_png(_pc_ihdr(), _pc_chunk(
+            b"tEXt", b"Description\x00only a description")))
+        self.assertIsNone(riview.extract_prompt(p))
+
+    def test_png_empty_value_skipped(self):
+        p = self._f("e.png", _pc_png(
+            _pc_ihdr(),
+            _pc_chunk(b"tEXt", b"parameters\x00   "),
+            _pc_chunk(b"tEXt", b"Comment\x00the real one")))
+        self.assertEqual(riview.extract_prompt(p), "the real one")
+
+    def test_png_truncated_chunk(self):
+        # The read bound clipped a chunk mid-body: the walk stops
+        # cleanly, no crash, no partial prompt. The tEXt chunk begins at
+        # byte 29 and needs 35 bytes (off+12+ln = 64); truncating below
+        # that trips the truncation guard.
+        full = _pc_png(_pc_ihdr(),
+                       _pc_chunk(b"tEXt", b"parameters\x00cut off here"))
+        p = self._f("t.png", full[:-20])
+        self.assertIsNone(riview.extract_prompt(p))
+
+    def test_split_parameters_unit(self):
+        sp = riview.split_parameters
+        self.assertEqual(sp("hello\nSteps: 4"), "hello")
+        self.assertEqual(sp("hello\nworld"), "hello\nworld")
+        self.assertEqual(sp("Steps: 4"), "")  # promptless metadata
+        self.assertEqual(sp("  Size: 512"), "")
+        self.assertEqual(sp("a\nCFG scale: 7"), "a")
+        self.assertEqual(sp("a\nSampler: euler\nSeed: 1"), "a")
+
+    # -- EXIF UserComment ---------------------------------------------------
+    def test_jpeg_ascii_usercomment(self):
+        p = self._f("j.jpg", _pc_jpeg_exif(_pc_tiff_uc("jpeg prompt")))
+        self.assertEqual(riview.extract_prompt(p), "jpeg prompt")
+
+    def test_jpeg_unicode_usercomment(self):
+        p = self._f("j2.jpg",
+                    _pc_jpeg_exif(_pc_tiff_uc("ünïcode prompt",
+                                               unicode=True)))
+        self.assertEqual(riview.extract_prompt(p), "ünïcode prompt")
+
+    def test_webp_exif_usercomment(self):
+        p = self._f("w.webp",
+                    _pc_webp_exif(_pc_tiff_uc("webp prompt", endian=b"MM")))
+        self.assertEqual(riview.extract_prompt(p), "webp prompt")
+
+    def test_jpeg_no_exif(self):
+        p = self._f("j3.jpg", b"\xff\xd8" + b"\xff\xdb" + b"\x00" * 10
+                    + b"\xff\xd9")
+        self.assertIsNone(riview.extract_prompt(p))
+
+    # -- not found ------------------------------------------------------------
+    def test_unknown_format(self):
+        p = self._f("u.tga", b"\x00" * 16)
+        self.assertIsNone(riview.extract_prompt(p))
+
+    def test_missing_file(self):
+        self.assertIsNone(
+            riview.extract_prompt(os.path.join(self.d, "nope.png")))
+
+    def test_read_bound(self):
+        fbody = b"filler\x00" + b"x" * 64  # non-matching key
+        ihdr = _pc_ihdr()
+        p = self._f("b.png", _pc_png(ihdr, _pc_chunk(b"tEXt", fbody),
+                                     _pc_chunk(b"tEXt",
+                                               b"parameters\x00bound prompt")))
+        self.assertEqual(riview.extract_prompt(p), "bound prompt")
+        # Bound clipped just past signature + IHDR + filler chunk: the
+        # prompt chunk lies beyond it → not found (spec §5.10).
+        bound = 8 + len(ihdr) + len(_pc_chunk(b"tEXt", fbody))
+        self.assertIsNone(riview.extract_prompt(p, bound=bound))
+
+
+class TestPromptInfo(unittest.TestCase):
+    """rev 1.8 (R33): the prompt information overlay surface, against
+    the real RiviewWindow methods with a fake window (no display):
+    toggle on i, `no information` fallback, update-on-swap, the R32
+    exclusivity (no state remembered), position seams, and the cosmetic
+    invariant. The on-screen look, wrapping, and elision are manual
+    case 42."""
+
+    @classmethod
+    def setUpClass(cls):
+        for var in ("DISPLAY", "WAYLAND_DISPLAY"):
+            os.environ.pop(var, None)
+        try:
+            _D, _W, cls.Window, _A = riview._gui_classes()
+        except Exception as e:
+            raise unittest.SkipTest(f"GTK not importable headless: {e}")
+        import gi
+        gi.require_version("Gdk", "4.0")
+        from gi.repository import Gdk
+        cls.Gdk = Gdk
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="riview-info-")
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _win(self, **kw):
+        return make_fake_window(self.Window, dir_abs=self.d, **kw)
+
+    def _key(self, w, keyval, *mods):
+        state = 0
+        for m in mods:
+            state |= int(m)
+        return self.Window._on_key(w, None, keyval, 0, state)
+
+    def _png_prompt(self, name, prompt):
+        p = os.path.join(self.d, name)
+        with open(p, "wb") as fh:
+            fh.write(_pc_png(_pc_ihdr(), _pc_chunk(
+                b"tEXt", b"parameters\x00" + prompt.encode())))
+        mtime = time.time() - 300
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def _snap(self, p):
+        return snap(p, os.stat(p).st_mtime_ns)
+
+    # -- toggle (i) ----------------------------------------------------------
+    def test_i_shows_prompt_and_toggles(self):
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        self._key(w, self.Gdk.KEY_i)
+        self.assertTrue(w._info_visible)
+        self.assertTrue(w._info_label.visible)
+        self.assertEqual(w._info_label.text, "a fox in the rain")
+        self._key(w, self.Gdk.KEY_i)
+        self.assertFalse(w._info_visible)
+        self.assertFalse(w._info_label.visible)
+
+    def test_i_shift_tolerated(self):
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        self._key(w, self.Gdk.KEY_I, self.Gdk.ModifierType.SHIFT_MASK)
+        self.assertTrue(w._info_visible)
+
+    def test_i_ctrl_not_shortcut(self):
+        w = self._win()
+        self.assertFalse(self._key(w, self.Gdk.KEY_i,
+                                   self.Gdk.ModifierType.CONTROL_MASK))
+        self.assertFalse(w._info_visible)
+
+    def test_i_no_r30_feedback(self):
+        # R33: i shows no R30 feedback — the overlay is its own.
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        self._key(w, self.Gdk.KEY_i)
+        self.assertFalse(w._feedback_label.visible)
+        self.assertEqual(w._feedback_label.calls, [])
+
+    # -- `no information` fallback --------------------------------------------
+    def test_i_waiting_no_information(self):
+        w = self._win()  # no snapshot: waiting state
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.text, riview.NO_INFO_TEXT)
+
+    def test_i_idle_no_information(self):
+        w = self._win(mode="none")  # idle state (R22)
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.text, riview.NO_INFO_TEXT)
+
+    def test_i_file_without_prompt(self):
+        p = os.path.join(self.d, "plain.png")
+        write(p, _png_bytes(2, 2), mtime=time.time() - 300)
+        w = self._win(snapshot=self._snap(p))
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.text, riview.NO_INFO_TEXT)
+
+    def test_image_gone_refreshes_visible_overlay(self):
+        # The display cleared while the overlay is up: it switches to
+        # `no information` (the display-cleared hooks, §5.10).
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.text, "a fox")
+        w.show_image_gone()
+        self.assertTrue(w.image_gone)
+        self.assertEqual(w._info_label.text, riview.NO_INFO_TEXT)
+        self.assertTrue(w._info_label.visible)  # still displayed
+        w2 = self._win(snapshot=self._snap(p))
+        self._key(w2, self.Gdk.KEY_i)
+        w2.show_waiting(None)
+        self.assertEqual(w2._info_label.text, riview.NO_INFO_TEXT)
+
+    # -- update-on-swap ---------------------------------------------------------
+    def test_update_on_swap(self):
+        a = self._png_prompt("a.png", "prompt a")
+        b = self._png_prompt("b.png", "prompt b")
+        w = self._win(snapshot=self._snap(a))
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.text, "prompt a")
+        # The display-swap path (_on_load_ok) re-runs the extraction
+        # while visible — the seam it calls:
+        w.snapshot = self._snap(b)
+        if w._info_visible:
+            w._info_update()
+        self.assertEqual(w._info_label.text, "prompt b")
+        # …and to `no information` when the new file has no prompt:
+        c = os.path.join(self.d, "c.png")
+        write(c, _png_bytes(2, 2), mtime=time.time() - 300)
+        w.snapshot = self._snap(c)
+        if w._info_visible:
+            w._info_update()
+        self.assertEqual(w._info_label.text, riview.NO_INFO_TEXT)
+        # Hidden: a display change does not re-show it:
+        self._key(w, self.Gdk.KEY_i)  # hide
+        w.snapshot = self._snap(b)
+        self.assertFalse(w._info_label.visible)
+
+    # -- exclusivity with the help overlay (R32) --------------------------------
+    def test_i_dismisses_help_then_shows(self):
+        w = self._win()
+        self._key(w, self.Gdk.KEY_h)
+        self.assertTrue(w._help_visible)
+        self._key(w, self.Gdk.KEY_i)
+        self.assertFalse(w._help_visible)
+        self.assertTrue(w._info_visible)
+        self.assertEqual(w._info_label.text, riview.NO_INFO_TEXT)
+
+    def test_h_dismisses_info_then_shows_help(self):
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        self._key(w, self.Gdk.KEY_i)
+        self._key(w, self.Gdk.KEY_h)
+        self.assertFalse(w._info_visible)
+        self.assertTrue(w._help_visible)
+        self.assertEqual(w._help_label.text, riview.HELP_TEXT)
+
+    def test_no_state_remembered(self):
+        # Dismissing the help does not re-show the info overlay; i
+        # re-shows it (spec §5.10 — "no state is remembered").
+        w = self._win()
+        self._key(w, self.Gdk.KEY_i)
+        self._key(w, self.Gdk.KEY_h)   # info dismissed, help shown
+        self._key(w, self.Gdk.KEY_a)   # unbound key dismisses the help
+        self.assertFalse(w._help_visible)
+        self.assertFalse(w._info_visible)
+        self._key(w, self.Gdk.KEY_i)
+        self.assertTrue(w._info_visible)
+
+    # -- position / wrap seams ---------------------------------------------------
+    def test_position_and_wrap_seams(self):
+        # Canvas 1280×720 (the fake defaults): 22% bottom margin, 80%
+        # wrap width fed through the (stubbed) char-budget seam.
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        self._key(w, self.Gdk.KEY_i)
+        self.assertEqual(w._info_label.margin_bottom,
+                         int(720 * riview.INFO_BOTTOM_FRAC))
+        self.assertEqual(w._info_label.max_width_chars,
+                         max(8, int(1280 * riview.INFO_WRAP_FRAC) // 12))
+
+    # -- cosmetic invariant ------------------------------------------------------
+    def test_i_does_not_touch_cycle_state(self):
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p), cycle_mode=True, cycle_s=9)
+        w._cycle_tick_id = "tick"  # armed (fake)
+        self._key(w, self.Gdk.KEY_i)
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(w._cycle_tick_id, "tick")
+        self._key(w, self.Gdk.KEY_i)  # hide: still untouched
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(w._cycle_tick_id, "tick")
+
+    def test_fullscreen_toggle_keeps_overlay(self):
+        # f/Esc/double-click do NOT dismiss the overlay (§5.10).
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        w.fullscreen = lambda: None
+        w.unfullscreen = lambda: None
+        self._key(w, self.Gdk.KEY_i)
+        self.Window._set_fullscreen(w, True)
+        self.assertTrue(w._info_visible)
+        self.assertTrue(w._info_label.visible)
+        self.assertTrue(w.fullscreen_mode)
+        self.Window._set_fullscreen(w, False)
+        self.assertTrue(w._info_visible)
+        # The deferred reposition is a no-op once hidden:
+        self._key(w, self.Gdk.KEY_i)  # hide
+        self.assertFalse(self.Window._info_reposition(w))
+
+
+class TestPromptCopy(unittest.TestCase):
+    """rev 1.8.1 (R34): prompt copy on Ctrl+C — the copy seam (case
+    8n: the text handed to the clipboard is a pure function of the
+    pre-press state) and the surface (effective-only feedback, the R32
+    dismiss-then-dispatch, the modifier match, the R33 coexistence,
+    the cosmetic invariant) against the real RiviewWindow methods with
+    a fake window (no display). The on-screen surface and the actual
+    clipboard contents are manual case 43."""
+
+    @classmethod
+    def setUpClass(cls):
+        for var in ("DISPLAY", "WAYLAND_DISPLAY"):
+            os.environ.pop(var, None)
+        try:
+            _D, _W, cls.Window, _A = riview._gui_classes()
+        except Exception as e:
+            raise unittest.SkipTest(f"GTK not importable headless: {e}")
+        import gi
+        gi.require_version("Gdk", "4.0")
+        from gi.repository import Gdk
+        cls.Gdk = Gdk
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="riview-copy-")
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _win(self, **kw):
+        return make_fake_window(self.Window, dir_abs=self.d, **kw)
+
+    def _png_prompt(self, name, prompt):
+        p = os.path.join(self.d, name)
+        with open(p, "wb") as fh:
+            fh.write(_pc_png(_pc_ihdr(), _pc_chunk(
+                b"tEXt", b"parameters\x00" + prompt.encode())))
+        mtime = time.time() - 300
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def _snap(self, p):
+        return snap(p, os.stat(p).st_mtime_ns)
+
+    def _ctrl(self):
+        return int(self.Gdk.ModifierType.CONTROL_MASK)
+
+    # -- the copy seam (case 8n): a pure function of the pre-press state --
+    def test_copy_text_prompt(self):
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        self.assertEqual(w._copy_text(), "a fox in the rain")
+
+    def test_copy_text_multiline_preserved(self):
+        p = self._png_prompt("b.png", "a fox\nin the rain")
+        w = self._win(snapshot=self._snap(p))
+        self.assertEqual(w._copy_text(), "a fox\nin the rain")
+
+    def test_copy_text_metadata_split(self):
+        # The SDCPP metadata line is NOT copied (R33 extraction):
+        p = self._png_prompt("c.png", "a fox\nSteps: 4, Seed: 1")
+        w = self._win(snapshot=self._snap(p))
+        self.assertEqual(w._copy_text(), "a fox")
+
+    def test_copy_text_no_prompt(self):
+        p = os.path.join(self.d, "plain.png")
+        write(p, _png_bytes(2, 2), mtime=time.time() - 300)
+        w = self._win(snapshot=self._snap(p))
+        self.assertIsNone(w._copy_text())
+
+    def test_copy_text_no_snapshot(self):
+        # waiting and idle: nothing displayed → nothing to copy:
+        for kw in ({}, {"mode": "none"}):
+            self.assertIsNone(self._win(**kw)._copy_text())
+
+    # -- the surface: effective-only (R30) ---------------------------------
+    def test_ctrl_c_copies_and_feedback(self):
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        handled = self.Window._on_key(w, None, self.Gdk.KEY_c, 0, self._ctrl())
+        self.assertTrue(handled)
+        self.assertEqual(w._clipboard, ["a fox in the rain"])
+        self.assertTrue(w._feedback_label.visible)
+        self.assertEqual(w._feedback_label.text, "prompt copied")
+
+    def test_ctrl_shift_c_alike(self):
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        state = self._ctrl() | int(self.Gdk.ModifierType.SHIFT_MASK)
+        self.assertTrue(self.Window._on_key(w, None, self.Gdk.KEY_C, 0, state))
+        self.assertEqual(w._clipboard, ["a fox"])
+
+    def test_ctrl_c_no_prompt_noop(self):
+        p = os.path.join(self.d, "plain.png")
+        write(p, _png_bytes(2, 2), mtime=time.time() - 300)
+        w = self._win(snapshot=self._snap(p))
+        handled = self.Window._on_key(w, None, self.Gdk.KEY_c, 0, self._ctrl())
+        self.assertTrue(handled)  # the key IS handled — the action is a no-op
+        self.assertEqual(w._clipboard, [])  # no clipboard write
+        self.assertFalse(w._feedback_label.visible)  # no overlay
+
+    def test_ctrl_c_no_snapshot_noop(self):
+        w = self._win()  # waiting state
+        self.assertTrue(self.Window._on_key(w, None, self.Gdk.KEY_c, 0,
+                                            self._ctrl()))
+        self.assertEqual(w._clipboard, [])
+        self.assertFalse(w._feedback_label.visible)
+
+    # -- the modifier match --------------------------------------------------
+    def test_bare_c_still_cycle(self):
+        # Regression guard: without Ctrl, c is the cycle key (R27).
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        self.Window._on_key(w, None, self.Gdk.KEY_c, 0, 0)
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(w._clipboard, [])
+
+    def test_ctrl_alt_c_unhandled(self):
+        # A modifier beyond Shift/locks: not the copy key, unhandled.
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        state = self._ctrl() | int(self.Gdk.ModifierType.ALT_MASK)
+        self.assertFalse(self.Window._on_key(w, None, self.Gdk.KEY_c, 0,
+                                             state))
+        self.assertEqual(w._clipboard, [])
+
+    # -- R32 dismiss-then-dispatch --------------------------------------------
+    def test_ctrl_c_dismisses_help_then_copies(self):
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p))
+        self.Window._on_key(w, None, self.Gdk.KEY_h, 0, 0)
+        self.assertTrue(w._help_visible)
+        self.Window._on_key(w, None, self.Gdk.KEY_c, 0, self._ctrl())
+        self.assertFalse(w._help_visible)  # dismissed first
+        self.assertEqual(w._clipboard, ["a fox"])
+        self.assertEqual(w._feedback_label.text, "prompt copied")
+
+    def test_ctrl_c_no_prompt_still_dismisses_help(self):
+        # R32: the keypress ALWAYS dismisses the help — even a no-op
+        # dispatch. Nothing is shown afterwards.
+        w = self._win()
+        self.Window._on_key(w, None, self.Gdk.KEY_h, 0, 0)
+        self.Window._on_key(w, None, self.Gdk.KEY_c, 0, self._ctrl())
+        self.assertFalse(w._help_visible)
+        self.assertEqual(w._clipboard, [])
+        self.assertFalse(w._feedback_label.visible)
+
+    # -- R33 coexistence + cosmetic invariant -----------------------------------
+    def test_ctrl_c_leaves_info_overlay_in_place(self):
+        p = self._png_prompt("a.png", "a fox in the rain")
+        w = self._win(snapshot=self._snap(p))
+        self.Window._on_key(w, None, self.Gdk.KEY_i, 0, 0)
+        self.assertTrue(w._info_visible)
+        self.Window._on_key(w, None, self.Gdk.KEY_c, 0, self._ctrl())
+        self.assertTrue(w._info_visible)  # not toggled, not dismissed
+        self.assertEqual(w._info_label.text, "a fox in the rain")
+        self.assertEqual(w._clipboard, ["a fox in the rain"])
+
+    def test_ctrl_c_does_not_touch_cycle_state(self):
+        p = self._png_prompt("a.png", "a fox")
+        w = self._win(snapshot=self._snap(p), cycle_mode=True, cycle_s=9)
+        w._cycle_tick_id = "tick"  # armed (fake)
+        self.Window._on_key(w, None, self.Gdk.KEY_c, 0, self._ctrl())
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(w._cycle_tick_id, "tick")
+    # -- the ctypes clipboard seam: the C ABI symbols must resolve ----------
+    def test_clipboard_symbols_present(self):
+        # The clipboard write goes through libgtk-4's C ABI — this
+        # environment's typelib exposes no text-clipboard helpers (§12.9).
+        # Guard against symbol drift; headless-safe (get_default returns
+        # NULL without a display and must not raise):
+        lib = riview._gtk_lib()
+        lib.gdk_display_get_default()
+        lib.gdk_display_get_clipboard
+        lib.gdk_clipboard_set_text
 
 
 if __name__ == "__main__":

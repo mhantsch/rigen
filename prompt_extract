@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""prompt_extract — prototype: pull the generation prompt out of an image.
+
+Extracts the prompt that `rigen` (or other generators) embed in image
+metadata. No dependencies: stdlib only. This is a PROTOTYPE to validate
+the extraction approach for a possible future riview feature — it is not
+part of riview and is not installed anywhere.
+
+Where prompts live (observed in practice):
+
+* PNG / WebP:  a `parameters` (or `prompt`) text chunk. The
+  stable-diffusion.cpp / SD.Next convention stores the prompt first,
+  then the generator's key/value metadata:
+
+      <prompt, possibly multi-line>
+      Steps: 4, CFG scale: 1.0, Seed: 42, Size: 256x256, ...
+
+  The prompt is therefore everything BEFORE the first line that starts
+  the metadata block (canonically `Steps: `; a couple of other leading
+  keys are accepted).
+* JPEG:        EXIF `UserComment` (tag 0x9286), ASCII or UTF-16.
+
+Usage:
+    ./prompt_extract FILE [FILE ...]
+    ./prompt_extract --verbose FILE ...
+
+Exit codes: 0 = a prompt was extracted from every file,
+            1 = at least one file yielded no prompt,
+            2 = usage / unreadable file.
+"""
+
+import struct
+import sys
+import zlib
+
+# Text-chunk keys that may carry a prompt (tried in order, case-sensitively
+# as stored; PNG tEXt keys are case-sensitive by convention).
+TEXT_KEYS = ("parameters", "prompt", "Prompt", "Comment")
+
+# Leading keys of the SDCPP/SD.Next metadata block; the metadata starts at
+# the first line whose stripped form begins with one of these.
+META_LEADS = ("Steps:", "CFG scale:", "Sampler:", "Seed:", "Size:")
+
+
+def _die(msg):
+    print(f"prompt_extract: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------- PNG ----
+
+def png_text_chunks(data):
+    """Yield (chunk_type, key, value_bytes) for tEXt / zTXt / iTXt chunks."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return
+    off = 8
+    n = len(data)
+    while off + 8 <= n:
+        try:
+            ln = struct.unpack(">I", data[off:off + 4])[0]
+        except struct.error:
+            return
+        typ = data[off + 4:off + 8]
+        body = data[off + 8:off + 8 + ln]
+        if off + 12 + ln > n:
+            return  # truncated chunk
+        if typ == b"tEXt":
+            k, _, v = body.partition(b"\x00")
+            yield b"tEXt", k, v
+        elif typ == b"zTXt":
+            k, _, rest = body.partition(b"\x00")
+            if rest:
+                try:
+                    v = zlib.decompress(rest[1:])
+                except zlib.error:
+                    v = b""
+                yield b"zTXt", k, v
+        elif typ == b"iTXt":
+            # lang-tag \0 utf8-flag \0 keyword \0 value
+            _lt, _, rest = body.partition(b"\x00")
+            if not rest:
+                yield b"iTXt", b"", b""
+                continue
+            flag = rest[:1]
+            _flag, _, kv = rest.partition(b"\x00")
+            k, _, v = kv.partition(b"\x00")
+            yield b"iTXt", k, v
+        off += 12 + ln
+        if typ == b"IEND":
+            return
+
+
+def split_prompt(params_text):
+    """Split SDCPP-style `parameters` text into (prompt, metadata_lines).
+
+    The prompt is everything before the first line that starts the
+    metadata block; a trailing blank/newline at the boundary is dropped.
+    If no metadata block is recognisable, the whole text is the prompt.
+    """
+    lines = params_text.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if any(stripped.startswith(lead) for lead in META_LEADS):
+            prompt = "\n".join(lines[:i]).rstrip()
+            meta = lines[i:]
+            return prompt, meta
+    return params_text.rstrip("\n"), []
+
+
+# ------------------------------------------------------------- EXIF -------
+# Minimal TIFF/EXIF reader: just enough to fetch UserComment (0x9286).
+
+def _tiff_get_u16(buf, off, endian):
+    return struct.unpack_from(endian + "H", buf, off)[0]
+
+
+def _tiff_get_u32(buf, off, endian):
+    return struct.unpack_from(endian + "I", buf, off)[0]
+
+
+def exif_usercomment(seg):
+    """Return the EXIF UserComment string from a TIFF payload, or None.
+
+    `seg` is the raw EXIF payload (the TIFF structure itself, starting
+    with the byte-order marker — not the 'Exif\\0\\0' header).
+    """
+    if len(seg) < 8:
+        return None
+    if seg[:2] == b"II":
+        endian = "<"
+    elif seg[:2] == b"MM":
+        endian = ">"
+    else:
+        return None
+    if _tiff_get_u16(seg, 2, endian) != 42:
+        return None
+
+    def read_ifd(off):
+        if off + 2 > len(seg):
+            return {}
+        n = _tiff_get_u16(seg, off, endian)
+        tags = {}
+        base = off + 2
+        for i in range(n):
+            e = base + i * 12
+            if e + 12 > len(seg):
+                break
+            tag = _tiff_get_u16(seg, e, endian)
+            typ = _tiff_get_u16(seg, e + 2, endian)
+            cnt = _tiff_get_u32(seg, e + 4, endian)
+            tags[tag] = (typ, cnt, seg[e + 8:e + 12])
+        return tags
+
+    def ascii_value(tags, tag):
+        """Decoded byte string for an ASCII (type 2) tag, or None."""
+        if tag not in tags:
+            return None
+        typ, cnt, val = tags[tag]
+        if typ != 2:
+            return None
+        if cnt <= 4:
+            return val[:cnt]
+        off = struct.unpack(endian + "I", val)[0]
+        if off + cnt > len(seg):
+            return None
+        return seg[off:off + cnt]
+
+    tags = read_ifd(_tiff_get_u32(seg, 4, endian))
+    # Most writers put UserComment in the 0th IFD; CIPA allows it in
+    # ExifIFD (tag 0x8769 points at that IFD) — check it as a fallback.
+    if 0x9286 not in tags and 0x8769 in tags:
+        typ, cnt, val = tags[0x8769]
+        if cnt == 1:
+            ptr = struct.unpack(endian + ("H" if typ == 3 else "I"),
+                                val[:4 if typ == 4 else 2])[0]
+            tags = read_ifd(ptr)
+    raw = ascii_value(tags, 0x9286)
+    if raw is None:
+        return None
+    # CIPA pads: "ASCII\0\0\0\0" or "Unicode\0\0\0" prefix (tolerate
+    # leading NULs from slightly offhand writers).
+    raw = raw.lstrip(b"\x00")
+    if raw[:5] == b"ASCII":
+        raw = raw[5:].lstrip(b"\x00")  # CIPA: 4 NUL bytes after the key
+    elif raw[:8] == b"Unicode\x00\x00\x00":
+        try:
+            return raw[8:].decode("utf-16-le").strip("\x00 \t")
+        except UnicodeDecodeError:
+            return None
+    txt = raw.decode("ascii", "replace")
+    txt = txt.split("\x00")[0].strip()
+    return txt or None
+
+
+def jpeg_exif_segments(data):
+    """Yield (kind, payload) for APP1 EXIF/XMP segments of a JPEG."""
+    if data[:2] != b"\xff\xd8":
+        return
+    i = 2
+    n = len(data)
+    while i + 4 <= n:
+        if data[i] != 0xFF:
+            return
+        marker = data[i + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        if marker == 0xDA:  # SOS: start of scan data
+            return
+        try:
+            ln = struct.unpack(">H", data[i + 2:i + 4])[0]
+        except struct.error:
+            return
+        body = data[i + 4:i + 2 + ln]
+        if marker == 0xE1:
+            if body[:6] == b"Exif\x00\x00":
+                yield "exif", body[6:]
+            elif body[:5] == b"http://ns.adobe.com/xap" or body.lstrip().startswith(b"<?xmp"):
+                yield "xmp", body
+        i += 2 + ln
+
+
+def webp_exif_payload(data):
+    """Return the EXIF TIFF payload inside a WebP RIFF file, or None."""
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    off = 12
+    n = len(data)
+    while off + 8 <= n:
+        fourcc = data[off:off + 4]
+        ln = struct.unpack("<I", data[off + 4:off + 8])[0]
+        if fourcc == b"EXIF":
+            body = data[off + 8:off + 8 + ln]
+            if body[:6] == b"Exif\x00\x00":
+                return body[6:]
+            return body
+        off += 8 + ln + (ln & 1)
+        if fourcc == b"ICCP" or fourcc == b"VP8 ":
+            continue
+    return None
+
+
+# ------------------------------------------------------------ extract ----
+
+def extract(path):
+    """Return (prompt, where) for a file, or (None, None)."""
+    try:
+        data = open(path, "rb").read()
+    except OSError as e:
+        _die(f"{path}: {e}")
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        for ctype, key, val in png_text_chunks(data):
+            if key in (k.encode() for k in TEXT_KEYS):
+                txt = val.decode("utf8", "replace").rstrip("\x00 \t\r\n")
+                if not txt:
+                    continue
+                prompt, _meta = split_prompt(txt)
+                if prompt:
+                    return prompt, f"{ctype.decode()} chunk, key={key.decode()!r}"
+        return None, None
+    if data[:2] == b"\xff\xd8":
+        for kind, payload in jpeg_exif_segments(data):
+            if kind == "exif":
+                uc = exif_usercomment(payload)
+                if uc:
+                    return uc, "EXIF UserComment"
+        return None, None
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        payload = webp_exif_payload(data)
+        if payload:
+            uc = exif_usercomment(payload)
+            if uc:
+                return uc, "EXIF UserComment (WebP)"
+        return None, None
+    return None, "unrecognised format"
+
+
+def main(argv):
+    args = [a for a in argv]
+    verbose = False
+    if "--verbose" in args or "-v" in args:
+        verbose = True
+        args = [a for a in args if a not in ("--verbose", "-v")]
+    if not args:
+        _die("usage: prompt_extract [--verbose] FILE [FILE ...]")
+    all_found = True
+    for path in args:
+        prompt, where = extract(path)
+        if prompt is None:
+            all_found = False
+            print(f"{path}: no prompt found{': ' + where if where else ''}")
+            continue
+        if verbose:
+            print(f"{path}: [{where}]")
+            print(prompt)
+            print("-" * 60)
+        else:
+            print(prompt)
+    return 0 if all_found else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

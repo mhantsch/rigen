@@ -1,8 +1,12 @@
 # riview — Reloading Image Viewer — Software Specification & Design
 
-**Status:** rev 1.7 — keypress feedback: a 1 s on-canvas overlay for the
-effective `c`/`p`/`n`/`Up`/`Down` keypresses in windowed and `--fullscreen`
-modes alike (new R30, §5.8; implemented as `riview` 1.7.2 — pale-yellow 2.5×
+**Status:** rev 1.8 — prompt information overlay: `i` (R18 conventions)
+toggles a **persistent** on-canvas overlay showing the generation prompt
+embedded in the **currently displayed** image — or `no information` — which
+updates on every display change (new R33 + §5.10; the §5.9 help list gains
+its line; `riview` 1.8.0), plus **`Ctrl+C` copies the displayed image's prompt to the clipboard** — a hidden feature (not in the §5.9 help list) with the R30 overlay `prompt copied` on an effective copy (new R34; `riview` 1.8.1). Rev 1.7: keypress feedback: a 1 s on-canvas
+overlay for the effective `c`/`p`/`n`/`Up`/`Down` keypresses in windowed
+and `--fullscreen` modes alike (new R30, §5.8; implemented as `riview` 1.7.2 — pale-yellow 2.5×
 text on a semi-transparent gray shade, bottom center with its bottom edge
 about 10% up from the canvas bottom; §11 cases 8k + 37/38), plus the `space`
 cycle/pause toggle (new R31; §11 cases 8l + 39); `--cycle` is **combinable** with `--cycle-time` (when both give a time, `--cycle-time` takes precedence — riview 1.7.3 fix, R29); a **file target** (R21) now starts in manual mode **pinned to that file** — the retired single-file mode (riview 1.7.4 amendment, §11 cases 27/30/40); a **keyboard help overlay** on `h`/`?` (new R32 + §5.9 — stays on screen until the next keypress, which dismisses it and executes it if bound — riview 1.7.5 amendment, §11 case 41). Rev 1.6: cycle mode (slide show) +
@@ -51,6 +55,7 @@ prints the `VERSION` constant (§12.3).
 | 1.5 | **Movement keys always pin; `p` pause; position-preserving image-gone (R23/R25 revised, new R26, D17):** every movement key (`Left`/`Right`/`Home`/`End`) is **two-phase** — *attempt a movement* over the settled candidate list (loading the target only when it differs from the display), then **pin whatever is displayed**; a failed attempt still pins. Consequences: in live mode every movement key **exits live mode** — `Right`/`End` (and `Left`/`Home` with a single settled image) pin the current display in place, the "freeze the stream" action; manual movement is otherwise unchanged (step/jump, load on change). The `Left`/`Right` anchor is the position where the displayed version sorts in the list by `(mtime, path)` — its own entry when settled, else the virtual position of its last known `(mtime, path)` — so **`Left`/`Right` work from the image-gone state** (the pin holds its last mtime; scanning continues after deleting the displayed file) and from a rewrite in flight. New key **`p`** (R26): pins the displayed image with no movement attempt. `n` remains the only key that resumes live mode. The image-gone message now also offers scanning. The "no-op / clamped-ignored" wording for movement keys is replaced throughout by the two-phase rule (R23/R25, §4.4, §5.5, §11, §12.9). Decision D17 (spec owner); D16 is superseded. Behavior change: rev 1.5 ↔ `riview` 1.5.1 (anchor-based `nav_target`, new `nav_anchor`; new freeze/pause/gone-stepping tests). *Patch 1.5.1:* implementation bug fix, no behavior change — the "newer" branch of `nav_target` iterated the list newest-first, so `Right` jumped to the **newest** candidate instead of stepping to the adjacent newer one (the "older" branch was correct); the walk test's missing intermediate assertions let it through. |
 | 1.6 | **Cycle mode / slide show (new R27–R29, new §5.7, §4.4, §12.9, D18/D19):** `c` enters **cycle mode**: starting at the currently displayed image, the display advances one *settled* image at a time toward the **newer** end of the navigation list (§5.5) every **cycle time**, wrapping from the newest to the **oldest** image and continuing. Live following (R3) is suspended while cycling: newly settled images do **not** interrupt the display — they join the list at the newest end and are shown when the cycle reaches them (the cycle grows as images are added; deleted files drop out). Any mode-selecting keypress exits cycle mode first, then applies its normal semantics (`Left`/`Right`/`Home`/`End`/`p` two-phase → manual, R23/R25/R26; `n` → live). Cycle time: `--cycle-time` (integer seconds, min 1, default **9**), dynamically adjustable with `Up`/`Down` (±1 s, floor 1 s), during *or* outside cycle mode — an adjustment rescales the current interval (elapsed time preserved, see the amendment below). Cycle position is re-derived from an anchor each tick (the §5.5 `nav_anchor` philosophy, so the list may grow/shrink underneath the cycle); failed decodes (R15) are skipped, never retried. Behaviour change: rev 1.6 ↔ `riview` 1.6.0. **Detail assumptions, confirmed by the spec owner (rev-1.6 review):** [A1] `c` while already cycling is a no-op (not a toggle); [A2] `p` is treated as a navigation key — it stops cycling and pins (manual); [A3] a deleted currently-shown slide is held on the canvas (no image-gone state) until the next advance, which continues from where the image was; [A4] cycling survives the list going empty (waiting state, R8) and resumes on the first settled candidate; [A5] `c` in the waiting state enters cycle mode armed — the first settled candidate becomes the first slide at the next advance; [A6] `--cycle-time` is integer seconds ≥ 1 — no fractions (0/negative → exit 2); [A7] the first advance is a full cycle time after `c`; the clock is not reset by new-image arrivals; a decode failure holds the previous slide and the next advance skips the failed file; [A8] `f`/`Esc`/`r`/canvas double-click leave cycle mode running; [A9] the header subtitle shows `· cycle Ns` while cycling (visible `Up`/`Down` feedback; hidden in `--fullscreen` per R16); [A10] *amended* — `Up`/`Down` rescale the **current** interval: the elapsed time of the in-progress slide is preserved (remaining = new time − elapsed; if the new time is shorter than the elapsed time the advance fires at the next tick), and every following interval uses the new full cycle time — worked example: cycle time 9 s with 2 s elapsed, `Down`×2 → 7 s, so this slide advances after 5 s and the next image gets a full 7 s; outside cycle mode the keys adjust the stored value only. Also confirmed (rev-1.6 review): a new time **shorter** than the elapsed time advances the slide pretty much immediately (next tick); an in-place rewrite of the currently shown slide reloads (R4) with the cycle clock **kept advancing** (defined edge case, confirmed). **Final amendment (spec owner):** a `--cycle` flag automatically enters cycle mode at startup; the first slide is the **oldest** settled image (R29, D19 — the spec owner's stated preference; starting at the newest and wrapping on the first advance was the acceptable fallback). Amended again by the spec owner: `--cycle` takes an **optional value in seconds** — the initial cycle time (flag alone = the 9 s default); originally also made **mutually exclusive** with `--cycle-time` (exit 2) — **retracted by the spec owner as a confirmation mistake (riview 1.7.3 fix)**: `--cycle` carries no interval of its own, so the combination is unambiguous — the flags are **combinable**: `--cycle --cycle-time 3` starts the cycle at 3 s, and when both give a time `--cycle-time` takes precedence. |
 | 1.7 | **Full-screen keypress feedback (new R30 + §5.8, §4.4, §12.7/§12.9):** in `--fullscreen` mode (R16) the header — the feedback channel for cycle mode and keypresses in windowed mode (R10/R28) — is hidden, so the spec owner asked for short, on-canvas feedback of mode-changing keypresses. The **effective** keypresses `c`, `p`, `n`, `Up`/`Down` now show an overlay — pale-yellow text (2.5× the normal size) on a semi-transparent gray shade, centered horizontally with its bottom edge about 10% up from the bottom of the canvas — for **1 second**: `c` → `cycle on: {N}s`, `p` → `pause`, `n` → `newest live image`, `Up`/`Down` → `cycle: {N}s` (N = the current cycle time). No-op keypresses show nothing — the overlay fires only when the keypress effects its named change, mirroring the §4.4/§5.5/§5.7 no-op rules (e.g. `c` while cycling / idle / single-file, `n` in live mode, `p` in manual / image-gone / waiting, `Down` at the 1 s floor). The overlay is shown in **windowed and full-screen modes alike** (pre-release amendment — originally full-screen-only, the windowed header keeps its persistent status instead of acting as the sole feedback channel); a further feedback keypress within the 1 s replaces the text and restarts the timer (last wins); a full-screen toggle (`f`/`Esc`/double-click) dismisses an active overlay immediately; nothing is shown at startup (e.g. `--cycle --fullscreen` opens without one). Purely cosmetic: the cycle clock (R28), selection (R3), decode (R7), and window size (R24) are unaffected; `f`/`Esc`/`r`/double-click/`q` show no overlay; `--print` unaffected (no window). R16 amended with the transient exception. Behaviour change: rev 1.7 ↔ `riview` 1.7.0. §11 cases 8k + 37. **Pre-release amendment (spec owner, before any 1.7 release):** the overlay is **not** full-screen-only — it shows in **windowed mode too** (the header keeps its persistent status, R10 — the overlay is the transient confirmation in both modes; the no-doubling rationale is retired), and its bottom edge is 10% up from the **canvas** bottom (the image area below the header bar — full-screen appearance is unchanged, there canvas == window), measured from the canvas container's allocated height at show time. Tracked as `riview` 1.7.1. §11 case 38. **Pre-release amendment 2 (spec owner, `riview` 1.7.2):** `space` **toggles between cycle and pause** — while not cycling it acts exactly as `c` (starts the cycle, overlay `cycle on: {N}s`), while cycling it acts exactly as `p` (stops the cycle and pins the current slide, overlay `pause`); no new mode, state, or message — an alias chosen by the current mode, inheriting all `c`/`p` no-op rules (R31, §4.4, §5.7, §11 cases 8l + 39). **Pre-release amendment 3 (spec owner, `riview` 1.7.4):** the **file target** (R21) is no longer a single-file watch mode — `riview IMG` now watches the **containing directory in full** and **starts in manual mode, pinned to that file**: the file displays **immediately** at process start (no initial settle wait), in-place updates reload once settled (R4), and every directory-mode key works from there (`Left`/`Right`/`Home`/`End`/`p`/`n`/`c`/`space` — all former "no observable effect in single-file mode" clauses are retired); the target file stays in the navigation list even when its extension is not in the `--extensions` set (the target file's own extension bypasses the filter; the default-set gate, exit 2, is unchanged); `--cycle` and `c` start the cycle **at the file** (R29's oldest-start rule does not apply — the explicit file is the start anchor); deleting the file at runtime lands in the **image-gone** state (R23; pin persists, reappearing restores). The term "single-file mode" is retired (now "file target"). §11 cases 27/30 rewritten, case 40 new. **Pre-release amendment 4 (spec owner, `riview` 1.7.5):** **keyboard help overlay** — `h` or `?` shows a list of all function keys with a short description for each (normative text, §5.9), in **all windowed states** (live, manual, cycle, waiting, idle, image-gone) and in both windowed and full-screen modes, **centered** on the canvas (same visual family as R30, normal font size). It **stays on screen until the next keypress**: that keypress **always** dismisses the overlay — if it is a bound function key it is **executed as usual** (a no-op dispatch also dismisses; the dismissing keypress's R30 feedback shows as usual, so the two overlays never coexist), any other key simply dismisses and keeps the current image or message screen; `h`/`?` themselves only dismiss (no re-show). Purely cosmetic (R28 clock / R3 selection / R7 decode / R24 sizing unaffected — cycle slides continue under the overlay). Nothing shown at startup; `--print` unaffected. New R32 + §5.9 + §4.4 row; §11 case 41. |
+| 1.8 | **Prompt information overlay (new R33 + §5.10, §4.4, §5.9, §12.7/§12.9/§12.11):** the spec owner asked for the generation prompt embedded in `rigen` images to be visible while viewing. `i` (R18 conventions) **toggles** a **persistent** on-canvas overlay showing the prompt extracted from the **currently displayed** image file — or **`no information`** when none is found, which includes every state with no displayed image (waiting (R8), idle (R22), image-gone (R23)). Display: word-wrapped at **80 % of the canvas width**, pale-yellow text at **1.5×** on the R30 gray shade, bottom-center column with its bottom edge **22 %** up from the canvas bottom — **above** the R30 feedback zone (bottom edge 10 %), so a 1 s R30 feedback can appear below it without overlap and expire as usual; content beyond **50 % of the canvas height** is elided (`…` on the last visible line). **Persistence:** no timer — stays until `i` again; every **display change** (movement keys, `p`, `n`, cycle advances, live arrivals, in-place updates) re-extracts the prompt from the newly displayed file and **updates the text in place**. **Exclusivity (spec owner):** the info overlay and the keyboard help (R32) **never coexist** — `i` dismisses the help (the R32 dismiss-then-dispatch rule) and shows the info overlay; `h`/`?` dismiss the info overlay and show the help; **no state is remembered** (dismissing one does not re-show the other). `i` shows **no** R30 feedback (the overlay is its own feedback); `f`/`Esc`/double-click do **not** dismiss the info overlay — a full-screen toggle keeps it, repositioned from the new canvas dimensions. **Sources (initial set — revisitable):** PNG `tEXt`/`zTXt`/`iTXt` chunks with keys `parameters`/`prompt`/`Prompt`/`Comment` — the prompt is the text before the first `Steps:`/`CFG scale:`/`Sampler:`/`Seed:`/`Size:` line (the stable-diffusion.cpp convention); JPEG/WebP EXIF `UserComment`; the read is bounded to the **first 8 MiB** (nothing within the bound → `no information`). The §5.9 help list gains the line `i   show prompt information` (13 lines). R16 amended (the info overlay is the second full-screen exception). Purely cosmetic: R28 clock, R3 selection, R7 decode, R24 sizing unaffected — in cycle mode the timer ticks under the overlay and slide changes update its text. Nothing shown at startup; `--print` unaffected. Behaviour change: rev 1.8 ↔ `riview` 1.8.0. §11 case 42 + 8m; case 41 extended. **Pre-release amendment 5 (spec owner, `riview` 1.8.1):** **prompt copy** — with the window focused, `Ctrl+C` (Shift tolerated) **copies the generation prompt of the currently displayed image to the system clipboard** — the **same text the R33 overlay shows** (the §5.10/§12.11 extraction). An **effective** copy shows the R30 overlay `prompt copied` (1 s); when nothing can be copied — no displayed image (waiting (R8), idle (R22), image-gone (R23)) or a file without a prompt — the keypress is a no-op: **no clipboard write and no overlay** (R30 effective-only). It is a **hidden feature**: the §5.9 help list is unchanged (13 lines). With the help (R32) displayed it **dismisses it first** (the R32 dismiss-then-dispatch rule — a bound key), and the `prompt copied` overlay then appears (R30 and R32 never coexist); with the info overlay (R33) displayed it **leaves it in place** and copies the same text it shows. The **terminal** `Ctrl+C` (SIGINT) and `SIGTERM` still quit (R18 clarified — the window-focused *keypress* is the copy, not a quit). Purely cosmetic beyond the clipboard write: R28 clock, R3 selection, R7 decode, R24 sizing unaffected — cycle mode keeps ticking. `--print` unaffected (no window). New R34 + §4.4 row + §5.10 bullet; §11 case 43 + 8n; case 23 clarified. Spec stays rev 1.8; tracked as `riview` 1.8.1. **Pre-release fix (latent R18 defect, found while verifying case 43):** this GLib/PyGObject invokes the `unix_signal_add` closure with **no arguments** — the old `signum`-required signature raised a `TypeError` on the first terminal `Ctrl+C` (and, the source being one-shot, consumed the handler, so the second press had to reach Python's default path); the closure signature now accepts both calling conventions (§13.2). |
 
 ---
 
@@ -163,9 +168,9 @@ Design goals, in order:
 | R13 | Exit codes per §8. All diagnostics go to **stderr**; stdout is reserved for `--print` output and nothing else. One target per process. |
 | R14 | **Watcher resilience:** if inotify monitoring cannot be established, `riview` falls back to polling and warns on stderr. If the target directory is deleted and recreated (new inode), monitoring is re-established on the new directory. |
 | R15 | A **decode failure** of a settled file (corrupt/truncated content) is reported once per file version on stderr; the viewer keeps the previous image (or the waiting state) and retries only if the file's version changes. No retry storms. |
-| R16 | `--fullscreen` starts the window in full-screen mode, **image only**: no header bar and no waiting-state text — just the black canvas and the image; the single transient exception is the 1 s keypress-feedback overlay (R30). |
+| R16 | `--fullscreen` starts the window in full-screen mode, **image only**: no header bar and no waiting-state text — just the black canvas and the image; the single transient exception is the 1 s keypress-feedback overlay (R30); the second exception is the prompt information overlay (R33 — persistent until `i`, positioned above the R30 zone, §5.10). |
 | R17 | The area of the window not covered by the image (letterbox) is **black**, in windowed and full-screen modes alike; the waiting-state text is white on it. |
-| R18 | **Keyboard shortcuts** (window focused; work in windowed *and* full-screen mode alike; bare keys — Shift tolerated, any other modifier leaves the key unhandled): `q` quits (exit 0); `f` toggles full screen ↔ windowed, both directions (header bar reappears on exit); `Esc` leaves full screen (no-op in windowed mode). `Ctrl+C` and `SIGTERM` also quit cleanly (exit 0, no traceback). |
+| R18 | **Keyboard shortcuts** (window focused; work in windowed *and* full-screen mode alike; bare keys — Shift tolerated, any other modifier leaves the key unhandled, **with one exception: `Ctrl+C` is the prompt-copy key (R34)**): `q` quits (exit 0); `f` toggles full screen ↔ windowed, both directions (header bar reappears on exit); `Esc` leaves full screen (no-op in windowed mode). `Ctrl+C` **in the terminal** (SIGINT) and `SIGTERM` quit cleanly (exit 0, no traceback) — a `Ctrl+C` **keypress with the window focused** copies the prompt instead (R34); it does not quit. |
 | R19 | A **left double-click** (two presses within 400 ms) **anywhere on the canvas** — on the image or on the black letterbox; the header bar is excluded — toggles full screen ↔ windowed, both directions, with the same effect as `f` (R18). |
 | R20 | **Desktop integration:** `--install-desktop` writes, per user (no root), a `.desktop` entry to `$XDG_DATA_HOME/applications/com.lemonade.riview.desktop` (default `$XDG_DATA_HOME` = `~/.local/share`) and the app's SVG icon to `$XDG_DATA_HOME/icons/hicolor/scalable/apps/com.lemonade.riview.svg`; the icon is **embedded in the script** (single-file property preserved). Both operations are idempotent. The entry uses `Exec=<absolute path to the riview script> %U` and registers `MimeType=inode/directory;` plus the default image MIME types, so the file manager's "Open with" can launch `riview` on a folder or an image; `%U`-supplied targets arrive as `file://` URIs and are accepted. `--uninstall-desktop` removes both files (a note on stderr, exit 0, if neither is present). |
 | R21 | **File target:** the target may be an image file instead of a directory. Then the file's **containing directory is watched in full** (a normal directory-mode scan, §5.1) and the view **starts in manual mode, pinned to the target file** (R23/R26 pin semantics): the file displays **immediately at process start** (no initial settle wait), and an in-place update of it reloads once settled (R4) — with no keypresses the view behaves exactly like a pinned manual selection: the file refreshes on change, while newer *other* files never displace it. Every directory-mode behaviour applies from there: `Left`/`Right`/`Home`/`End` navigate the containing directory's settled candidates (R23/R25), `p` is a no-op (already pinned, R26), `n` returns to the newest and resumes live following (R23), and `c`/`space` start the cycle **from the file** (R27/R31; `--cycle` likewise, R29). The target file is a member of the navigation list **even when its extension is not in the `--extensions` set** (the target file's own extension bypasses the filter, §5.1); its extension must be in the *default* extension set, else usage error (exit 2, §4.2). If the file ceases to be a candidate at runtime (deleted, renamed away), the display enters the **image-gone state** (R23): the pin persists with its last mtime, the file reappearing and settling restores the display, and `n` exits to the newest. `--print` (R12) still prints the file itself. *(Pre-release amendment, riview 1.7.4: the original "single-file watch mode" — only that file is ever displayed, keys inert — is retired; the term "single-file mode" no longer exists.)* |
@@ -177,9 +182,11 @@ Design goals, in order:
 | R27 | **Cycle mode — slide show (directory mode):** with the window focused, `c` (or `space` when not cycling, R31 — R18 key conventions) enters **cycle mode**: starting at the currently displayed image, the display **advances** one settled image at a time toward the **newer** end of the navigation list (§5.5) every **cycle time** (R28); when the newest settled image is reached, the cycle **wraps to the oldest** settled image and continues. Only **settled** candidates are ever shown — a file still inside its settle window is never a slide (§5.5 rationale). While cycling, live following is **suspended** (R3): newly settled images do **not** interrupt the display; they join the cycle list at the newest end and are shown when the cycle reaches them — the cycle **grows** as new images settle, and files deleted from the directory drop out of the list. Each advance is a normal decode request (dual-buffered, R7); a slide whose version fails to decode (R15) is skipped by subsequent advances, never retried. The cycle position is **re-derived from an anchor on every advance** (the displayed version's entry in the list, or its virtual `(mtime, path)` position when the displayed file is not a settled candidate — §5.5 anchor rules), never stored as an index, so the list may grow and shrink underneath the cycle. Any keypress that selects a display mode **exits cycle mode first**, then applies its normal semantics: `Left`/`Right`/`Home`/`End`/`p` are two-phase as usual (R23/R25/R26) — the attempt resolves against the currently displayed image and then pins it (→ manual mode); `n` exits to **live** mode (newest, R3 resumed). Keys that do not select a display mode — `f`, `Esc`, `r`, the canvas double-click — leave cycle mode running. `c` while already in cycle mode is a no-op. If the currently shown slide ceases to be a candidate (deleted, renamed away), the canvas **holds the last decoded slide** (no image-gone state while cycling); the next advance continues from where that image was (virtual anchor). If no settled candidate exists (nothing on the list), the display shows the waiting state (R8) and cycle mode **stays active** — the first settling candidate becomes a slide at the next advance. `c` in the waiting state enters cycle mode immediately (armed): no advance occurs until the first candidate settles. An in-place update of the displayed slide reloads once settled (R4), as with pinning; the next advance anchors on the new version. In the idle state (R22) there is no directory. For a file target (R21) the cycle starts from the target file, which is a member of the navigation list (§5.1). Advances never resize the window (R24); `--print` unaffected. |
 | R28 | **Cycle time:** the cycle time is set by `--cycle-time` — **integer seconds, minimum 1, default 9** (`0` or negative → usage error, exit 2). `Up`/`Down` (R18 key conventions) **increase / decrease the cycle time by 1 second** at any time — during *or* outside cycle mode — without changing the mode or the display; `Down` at the minimum (1 s) has no effect. An adjustment **rescales the current interval immediately**: the elapsed time of the in-progress slide is preserved — its deadline becomes `now + (new time − elapsed)`; if the new time is **shorter** than the elapsed time (the slide has already outlived its new allotment) the advance fires at the next tick; every following interval is the new full cycle time (worked example: 9 s with 2 s elapsed, `Down`×2 → 7 s → this slide advances after 5 s, the next image gets a full 7 s). The first advance occurs a full cycle time after `c` (the starting image is shown for one full interval), and the cycle clock is not reset by new-image arrivals or by decode failures. While cycling, the header subtitle shows the current value — the R10 subtitle plus ` · cycle {N}s` — so `Up`/`Down` adjustments are visible; the header is hidden in `--fullscreen` (R16), where the R30 overlay (`cycle: {N}s`, `cycle on: {N}s`) is the visible feedback instead. |
 | R29 | **Cycle mode at startup (`--cycle`):** with the flag `--cycle`, `riview` enters **cycle mode automatically at process start** — before any display — instead of starting in live mode: the **first displayed image is the oldest settled candidate** (the last entry of the cycle list, §5.7), not the newest that R3 would show at startup; from there the cycle advances toward the newer end every cycle time and wraps from the newest to the oldest exactly as usual (R27). If no candidate is settled at startup, the waiting state (R8) is shown with cycle mode armed (as for `c` in the waiting state, R27) and the first displayed image is the **oldest** candidate of the first non-empty settled list. No live-mode window ever opens: the first display already belongs to the cycle. All other `--cycle`/cycle-mode semantics are R27/R28 (keys, rescale, wrap, failed-skip, image-gone hold). `--cycle` takes an **optional value — the initial cycle time in seconds** (the flag alone = the R28 default of 9 s; a value must be an integer ≥ 1, §4.2) and is **combinable with `--cycle-time`** — when both give a time, **`--cycle-time` takes precedence** (the dedicated interval option; the flag's value is then ignored — rev 1.7.3 fix). For a **file target** (R21) the first slide is **the target file** — the oldest-start rule does not apply, the explicit file is the start anchor (rev 1.7.4); in `--print` mode (R12) the flag is inert (no window, no cycle state). |
-| R30 | **Keypress feedback (overlay):** an **effective** keypress of `c`, `p`, `n`, `Up`, `Down`, or `space` shows a **brief text overlay** on the canvas for **1 second**, in **windowed and `--fullscreen` (R16) modes alike**, then it disappears: `c` → `cycle on: {N}s`, `p` → `pause`, `n` → `newest live image`, `Up`/`Down` → `cycle: {N}s`, `space` → the text of the action it dispatches (R31) (N = the current cycle time). An overlay appears **only when the keypress effects its named change** — no-op keypresses show nothing (`c` while already cycling / in the idle state; `p` in manual mode, the image-gone state, or the waiting state (R26); `n` when already in live mode (R23); `Down` at the 1 s floor (R28); `space` when its dispatch is a no-op (R31)). The overlay appears **in both modes** (pre-release amendment, tracked as `riview` 1.7.1): in windowed mode the header (R10 subtitle, `· cycle {N}s` indicator, R28) keeps its **persistent** status — the overlay is the **transient** confirmation (the original no-doubling rationale is retired). Position: bottom center of the canvas, its bottom edge **10% up from the canvas bottom** (below the header bar in windowed mode; canvas == window in full screen), computed from the canvas container's allocated height at show time. A further feedback keypress within the 1 s **replaces the text and restarts the 1 s timer** (last wins). A full-screen toggle (`f`/`Esc`/canvas double-click) **dismisses an active overlay immediately**. The overlay is purely cosmetic: it does not affect the cycle clock or deadlines (R28), selection (R3/R5), decode (R7), or window size (R24); nothing is shown at startup (e.g. `--cycle --fullscreen` opens without one); `f`/`Esc`/`r`/`h`/`?`/double-click/`q` show no overlay (`h`/`?` have their own overlay, R32); `--print` mode is unaffected (no window, R12). |
+| R30 | **Keypress feedback (overlay):** an **effective** keypress of `c`, `p`, `n`, `Up`, `Down`, `space`, or `Ctrl+C` (R34) shows a **brief text overlay** on the canvas for **1 second**, in **windowed and `--fullscreen` (R16) modes alike**, then it disappears: `c` → `cycle on: {N}s`, `p` → `pause`, `n` → `newest live image`, `Up`/`Down` → `cycle: {N}s`, `space` → the text of the action it dispatches (R31), `Ctrl+C` → `prompt copied` (R34) (N = the current cycle time). An overlay appears **only when the keypress effects its named change** — no-op keypresses show nothing (`c` while already cycling / in the idle state; `p` in manual mode, the image-gone state, or the waiting state (R26); `n` when already in live mode (R23); `Down` at the 1 s floor (R28); `space` when its dispatch is a no-op (R31); `Ctrl+C` when nothing can be copied (R34)). The overlay appears **in both modes** (pre-release amendment, tracked as `riview` 1.7.1): in windowed mode the header (R10 subtitle, `· cycle {N}s` indicator, R28) keeps its **persistent** status — the overlay is the **transient** confirmation (the original no-doubling rationale is retired). Position: bottom center of the canvas, its bottom edge **10% up from the canvas bottom** (below the header bar in windowed mode; canvas == window in full screen), computed from the canvas container's allocated height at show time. A further feedback keypress within the 1 s **replaces the text and restarts the 1 s timer** (last wins). A full-screen toggle (`f`/`Esc`/canvas double-click) **dismisses an active overlay immediately**. The overlay is purely cosmetic: it does not affect the cycle clock or deadlines (R28), selection (R3/R5), decode (R7), or window size (R24); nothing is shown at startup (e.g. `--cycle --fullscreen` opens without one); `f`/`Esc`/`r`/`h`/`?`/`i`/double-click/`q` show no overlay (`h`/`?` have their own overlay, R32; `i` likewise, R33); `--print` mode is unaffected (no window, R12). |
 | R31 | **`space` — the cycle/pause toggle (directory mode, rev 1.7.2):** `space` toggles between **cycle mode** (R27) and **pause** (R26), the action being chosen by the current mode: while **not** cycling it acts *exactly* as `c` — it starts cycle mode from the currently displayed image (all R27 semantics, including the no-op in the idle state); while **cycling** it acts *exactly* as `p` — it stops the cycle and pins the current slide (manual mode, the R26 stop-and-pin). Pressing it again reverses: from the pause it restarts the cycle at the currently displayed image (as `c`). It shows the R30 overlay of the action it dispatches (`cycle on: {N}s` / `pause`) exactly when that action is effective; a no-op dispatch shows nothing. No new mode, state, or message — `space` is an alias, and every existing `c`/`p` rule applies to it unchanged. |
-| R32 | **Keyboard help overlay:** with the window focused, `h` or `?` (R18 key conventions — bare key, Shift tolerated) shows a **keyboard help overlay** on the canvas, in **all windowed states** (live, manual, cycle, waiting (R8), idle (R22), image-gone (R23)) and in **windowed and `--fullscreen` (R16) modes alike**: the list of all function keys with a short description for each (normative text in §5.9), **centered** on the canvas (both axes), the same visual family as R30 (pale-yellow text on a semi-transparent gray shade) but at **normal** font size (not 2.5× — the list must be readable at the default window size, 900×675, R24). The overlay **stays on screen until the next keypress**: that keypress **always** dismisses the overlay; if the key is a **bound function key** (the §4.4 table) it is then **executed as usual** (a no-op dispatch also dismisses — the overlay disappears either way); any other key simply dismisses it and the current image or message screen keeps showing. While the help is displayed, `h`/`?` themselves **only dismiss** (no re-show — the overlay can always be closed with `h`). The **dismissing keypress's R30 feedback shows as usual** (e.g. `n` with the help displayed → the help closes and then the `newest live image` overlay appears for 1 s) — the two overlays **never coexist** (the keypress closes the help first); `h`/`?` themselves show no R30 overlay (joining `f`/`Esc`/`r`/`q` on the no-overlay list). **Nothing is shown at startup**; `--print` (R12) unaffected (no window). **Purely cosmetic:** the help overlay does not affect the cycle clock (R28), selection (R3), decode (R7), or window size (R24) — in cycle mode the timer **keeps ticking under the overlay** and slides may change while it is displayed; a later keypress acts on the *current* slide. *(Rev 1.7, pre-release amendment 4 — riview 1.7.5.)* |
+| R32 | **Keyboard help overlay:** with the window focused, `h` or `?` (R18 key conventions — bare key, Shift tolerated) shows a **keyboard help overlay** on the canvas, in **all windowed states** (live, manual, cycle, waiting (R8), idle (R22), image-gone (R23)) and in **windowed and `--fullscreen` (R16) modes alike**: the list of all function keys with a short description for each (normative text in §5.9), **centered** on the canvas (both axes), the same visual family as R30 (pale-yellow text on a semi-transparent gray shade) but at **normal** font size (not 2.5× — the list must be readable at the default window size, 900×675, R24). The overlay **stays on screen until the next keypress**: that keypress **always** dismisses the overlay; if the key is a **bound function key** (the §4.4 table) it is then **executed as usual** (a no-op dispatch also dismisses — the overlay disappears either way); any other key simply dismisses it and the current image or message screen keeps showing. While the help is displayed, `h`/`?` themselves **only dismiss** (no re-show — the overlay can always be closed with `h`). The **dismissing keypress's R30 feedback shows as usual** (e.g. `n` with the help displayed → the help closes and then the `newest live image` overlay appears for 1 s) — the two overlays **never coexist** (the keypress closes the help first); `h`/`?` themselves show no R30 overlay (joining `f`/`Esc`/`r`/`q` on the no-overlay list). **Nothing is shown at startup**; `--print` (R12) unaffected (no window). **Purely cosmetic:** the help overlay does not affect the cycle clock (R28), selection (R3), decode (R7), or window size (R24) — in cycle mode the timer **keeps ticking under the overlay** and slides may change while it is displayed; a later keypress acts on the *current* slide. **Exclusivity with the prompt information overlay (R33, rev 1.8):** showing the help dismisses an active info overlay, and `i` (a bound key — the dismiss-then-dispatch rule above) dismisses the help and then shows the info overlay — the two **never coexist**, and **no state is remembered** (dismissing the help later does not re-show the info overlay). *(Rev 1.7, pre-release amendment 4 — riview 1.7.5.)* |
+| R33 | **Prompt information overlay:** with the window focused, `i` (R18 key conventions — bare key, Shift tolerated) **toggles** a **prompt information overlay** on the canvas, in **all windowed states** (live, manual, cycle, waiting (R8), idle (R22), image-gone (R23)) and in **windowed and `--fullscreen` (R16) modes alike**: the **generation prompt** extracted from the **currently displayed** image file (sources and the 8 MiB read bound in §5.10) — or **`no information`** when no prompt is found, which includes every state with no displayed image. Display: word-wrapped at **80 % of the canvas width**, pale-yellow text at **1.5×** the normal font size on a semi-transparent gray shade (the R30 visual family), in the bottom-center column with its bottom edge **22 % up from the canvas bottom** — above the R30 feedback zone (bottom edge 10 %), so a 1 s R30 feedback can appear below it without overlap and expire as usual while the overlay stays; content taller than **50 % of the canvas height** is elided, the last visible line ending in `…`. **Persistence:** the overlay has **no timer** — it stays on screen until `i` is pressed again; every **display change** (movement keys, `p`, `n`, cycle advances (R27), live arrivals (R1/R3), in-place updates (R4) — any new displayed image version, §5.4) re-extracts the prompt from the newly displayed file and **updates the text in place** (to another prompt, or to `no information`). **Exclusivity with the help overlay (R32):** the two **never coexist**, and **no state is remembered** — `i` with the help displayed dismisses the help (the R32 dismiss-then-dispatch rule) and then shows the info overlay; `h`/`?` with the info overlay displayed dismiss the info overlay and then show the help; dismissing the help later does not re-show the info overlay (`i` again does). **No R30 feedback for `i`** (the overlay is its own feedback — `i` joins `f`/`Esc`/`r`/`h`/`?`/`q` on the no-overlay list); a concurrent R30 feedback (e.g. `c` while the overlay is displayed) appears **below** it as usual and expires after 1 s. `f`/`Esc`/canvas double-click **do not dismiss** the overlay — a full-screen toggle keeps it, **repositioned** from the new canvas dimensions (windowed resize is not tracked — the GTK4 constraint, as R30). **Purely cosmetic:** the overlay does not affect the cycle clock or deadlines (R28), selection (R3/R5), decode (R7), or window size (R24) — in cycle mode the timer **keeps ticking under the overlay** and each advance updates its text. Nothing is shown at startup; `--print` (R12) unaffected (no window). *(Rev 1.8 — `riview` 1.8.0.)* |
+| R34 | **Prompt copy (hidden feature, rev 1.8 amendment 5):** with the window focused, `Ctrl+C` (and `Ctrl+Shift+C` — Shift tolerated, R18 convention) **copies the generation prompt of the currently displayed image to the system clipboard** — the **same text the prompt information overlay (R33) displays**: the §5.10/§12.11 extraction (PNG text chunks / JPEG–WebP EXIF `UserComment`, 8 MiB read bound) — in **all windowed states** (live, manual, cycle, waiting (R8), idle (R22), image-gone (R23)) and in **windowed and `--fullscreen` (R16) modes alike**. **Effective-only (R30):** a copy actually performed shows the R30 overlay `prompt copied` for 1 s; when there is **nothing to copy** — no displayed image (waiting / idle / image-gone) or the displayed file carries no prompt — the keypress is a **no-op: no clipboard write and no overlay**. **Exclusivity:** with the keyboard help (R32) displayed, `Ctrl+C` **dismisses it first** (the R32 dismiss-then-dispatch rule — it is a bound key) and, when a copy is performed, the `prompt copied` overlay then appears (R30 and R32 never coexist); with the prompt information overlay (R33) displayed it **leaves it in place** (no toggle, no dismissal) and the copied text is the same as the text it shows. **Hidden feature:** it is **not** in the §5.9 help list (the 13 lines are unchanged) — documented here, in the README, and in §11 only. **Purely cosmetic beyond the clipboard write:** no effect on the cycle clock or deadlines (R28), selection (R3/R5), decode (R7), or window size (R24) — in cycle mode the timer keeps ticking under it and the copy takes the *current* slide's prompt. `--print` (R12) unaffected (no window); `Ctrl+C` **in the terminal** (SIGINT) and `SIGTERM` still quit cleanly (R18). *(Rev 1.8, pre-release amendment 5 — `riview` 1.8.1.)* |
 
 ### 3.1 Non-functional
 
@@ -220,7 +227,7 @@ it may be a `file://` URI (the desktop entry's `%U`, R20).
 | `--poll` | float seconds, > 0 | off | Force polling mode with the given interval (R2). Also serves as the fallback interval when inotify is unavailable and this flag was given. |
 | `--max-dim` | int px ≥ 0 | `0` | Absolute cap on the **longer side** of the decoded image, in pixels. `0` (default) means no cap beyond the decode-target scaling (§7.1). |
 | `--fit` (synonym `--fit-window`) | `ratio` / `exact` / `off` | `ratio` | Window fit mode (R24, §5.6): how the window is sized to the first displayed image — `ratio`: the image's aspect ratio within the 80 % budget box (itself capped at the D15 COSMIC box, 1600×1200 logical px, until the upstream COSMIC clamping bug is fixed); `exact`: 1:1 logical pixels, capped at the screen minus the header; `off`: the D11 pre-image size only. Inert in `--print`/`--fullscreen`. |
-| `--fullscreen` | flag | off | Start full-screen, image only: no header bar, no waiting-state text (R16) — the 1 s keypress-feedback overlay may still appear (R30). Usage error (exit 2) when no target resolves (R22). |
+| `--fullscreen` | flag | off | Start full-screen, image only: no header bar, no waiting-state text (R16) — the 1 s keypress-feedback overlay may still appear (R30), and the prompt information overlay may be shown (R33). Usage error (exit 2) when no target resolves (R22). |
 | `--print` | flag | off | Headless query mode (R12): print the absolute path of the image `riview` would display (`none` if a directory has no candidates) and exit. No GUI, no settle wait. |
 | `--install-desktop` | flag | off | Install the per-user `.desktop` entry + icon (R20), then exit 0. Headless. |
 | `--uninstall-desktop` | flag | off | Remove the per-user `.desktop` entry + icon (R20), then exit 0. Headless. |
@@ -280,8 +287,10 @@ double-click do not affect it; `Up`/`Down` adjust the cycle time (R28).
 | Key | Action |
 |-----|--------|
 | `q` | Quit (exit 0). |
-| `h` or `?` | **R32:** show the keyboard help overlay (§5.9) — all windowed states, windowed and full-screen alike. Stays until the next keypress; that keypress always dismisses it and, if it is a bound function key, executes it as usual (any other key simply dismisses). `h`/`?` only dismiss (no re-show). |
-| `Ctrl+C` / `SIGTERM` | Quit cleanly (exit 0, no traceback — §11 case 22). |
+| `h` or `?` | **R32:** show the keyboard help overlay (§5.9) — all windowed states, windowed and full-screen alike. Stays until the next keypress; that keypress always dismisses it and, if it is a bound function key, executes it as usual (any other key simply dismisses). `h`/`?` only dismiss (no re-show). Dismisses an active prompt information overlay (R33 — the two never coexist). |
+| `i` | **R33:** toggle the **prompt information overlay** (§5.10) — the generation prompt of the currently displayed image, or `no information`, all windowed states, windowed and full-screen alike. **Stays until `i` again**; every display change updates its text. No R30 feedback (the overlay is its feedback). Dismisses an active keyboard help overlay (R32 — the two never coexist). |
+| `Ctrl+C` (window focused) | **R34 (hidden — not in the §5.9 help):** copy the **currently displayed image's prompt** — the same text the R33 overlay shows — to the **system clipboard** (Shift tolerated: `Ctrl+Shift+C` alike). R30 overlay `prompt copied` when a copy is actually performed; nothing to copy (no prompt / no displayed image) → no-op, no overlay, clipboard unchanged. Dismisses an active keyboard help overlay (R32) first. |
+| `Ctrl+C` (terminal) / `SIGTERM` | Quit cleanly (exit 0, no traceback — the signal path; §11 case 22). |
 | `f` | Toggle full screen ↔ windowed, both directions. |
 | `Esc` | Leave full screen. No-op in windowed mode. |
 | `Left` | Step one image **older**, then **pin the result** (R23, §5.5). In live mode this exits live mode — a step that can't resolve (single image, or nothing older) still pins the display. Works from the image-gone state: it steps from where the image was (the pin remembers its mtime). |
@@ -693,7 +702,7 @@ and `r` are unaffected); `--print` is unaffected (it has no cycle state).
 
 ### 5.8 Keypress feedback overlay (R30)
 
-The four feedback keypresses show a brief message on the canvas, visible for
+The feedback keypresses show a brief message on the canvas, visible for
 **1 second**, in **windowed and full-screen modes alike**: pale-yellow text at
 about 2.5× the normal font size, centered horizontally with its bottom edge
 about **10% up from the bottom of the canvas** (below the header bar in
@@ -708,15 +717,19 @@ the message stays readable over any image (appearance per §12.7):
 | `p` (the pin engages) | `pause` |
 | `n` (back to live following on the newest) | `newest live image` |
 | `Up` / `Down` (the cycle time changes) | `cycle: {N}s` |
+| `Ctrl+C` (R34 — a copy actually performed) | `prompt copied` |
 
 ("{N}" is the current cycle time in seconds.) `space` (R31) shows the text
 of the action it dispatches — `cycle on: {N}s` (as `c`) or `pause` (as `p`);
-a no-op dispatch shows nothing.
+a no-op dispatch shows nothing. `Ctrl+C` (R34) shows `prompt copied` when a
+copy is actually performed; a no-op copy (nothing to copy — R34) shows
+nothing.
 
 - **Effective** = the keypress effects the named change; the no-op rules of
   §4.4/§5.5/§5.7 decide — `c` while already cycling, in the idle state;
   `p` in manual mode, the image-gone state, or the waiting
-  state; `n` when already in live mode; `Down` at the 1 s floor — show
+  state; `n` when already in live mode; `Down` at the 1 s floor; `Ctrl+C`
+  with nothing to copy (R34) — show
   **nothing** (a feedback message for a no-op would be false feedback).
 - **Both modes (pre-release amendment; `riview` 1.7.1):** in windowed mode
   the header (R10 subtitle, the `· cycle {N}s` indicator of R28) keeps its
@@ -732,8 +745,9 @@ a no-op dispatch shows nothing.
   deadlines (R28 — an overlay neither delays nor advances a slide), selection
   (R3), the decode pipeline (R7), or the window size (R24); nothing is shown
   at startup (the overlay is keypress feedback, not a state indicator —
-  `--cycle --fullscreen` opens without one); `f`/`Esc`/`r`/double-click/`q`
-  show no overlay. `--print` mode has no window and is unaffected (R12).
+  `--cycle --fullscreen` opens without one); `f`/`Esc`/`r`/`i`/double-click/
+  `q` show no overlay (`i` has its own overlay, R33). `--print` mode has no
+  window and is unaffected (R12).
 - Headless-testable: which text (or none) a keypress shows is a pure
   function of the keypress and the pre-press state (case 8k); the on-screen
   surface (show, 1 s expiry, replace, dismiss-on-toggle) is manual cases 37
@@ -745,7 +759,7 @@ a no-op dispatch shows nothing.
 
 - **Trigger:** `h` or `?` (R18 conventions: bare key, Shift tolerated — `?` already requires Shift), window focused, in **every** windowed state (live / manual / cycle / waiting / idle (R22) / image-gone (R23)), windowed and `--fullscreen` alike.
 - **Display:** the list below, **centered** on the canvas (both axes), pale-yellow text on a semi-transparent gray shade (the R30 visual family), at **normal** font size (≈1×, not R30's 2.5×) — readable at the default window size (900×675, R24). Column alignment and padding are presentation details; the **strings** are normative.
-- **Persistence & dismissal:** the overlay stays on screen until the **next keypress**. That keypress **always** dismisses it; if the key is a bound function key (§4.4) it is then **executed as usual** (a no-op dispatch also dismisses); any other key simply dismisses it and the current image or message screen keeps showing. While the help is displayed, `h`/`?` only dismiss (no re-show). Showing the help immediately hides an active R30 feedback overlay (the two never coexist); the R30 feedback of the **dismissing** keypress is shown as usual after the dismissal (the normal dispatch path).
+- **Persistence & dismissal:** the overlay stays on screen until the **next keypress**. That keypress **always** dismisses it; if the key is a bound function key (§4.4) it is then **executed as usual** (a no-op dispatch also dismisses); any other key simply dismisses it and the current image or message screen keeps showing. While the help is displayed, `h`/`?` only dismiss (no re-show). Showing the help immediately hides an active R30 feedback overlay (the two never coexist); the R30 feedback of the **dismissing** keypress is shown as usual after the dismissal (the normal dispatch path). The same exclusivity applies to the prompt information overlay (R33): showing the help dismisses an active info overlay, and `i` (a bound key) dismisses the help and then shows the info overlay — the two **never coexist**, and **no state is remembered** (dismissing the help later does not re-show the info overlay; `i` again re-shows it).
 - **Cosmetic invariant:** no effect on the R28 clock/deadline, R3 selection, R7 decode, or R24 sizing — in cycle mode the timer ticks under the overlay, slides may change while it is displayed, and a later keypress acts on the *current* slide. Nothing is shown at startup; `--print` unaffected.
 
 **Help text (normative — shown with the `Keys` header line):**
@@ -762,8 +776,86 @@ Keys
   r                re-fit window to image
   f / Esc          toggle full screen
   h / ?            show this help
+  i                show prompt information
   q                quit
 ```
+
+### 5.10 Prompt information overlay (R33; rev 1.8)
+
+- **Trigger:** `i` (R18 conventions: bare key, Shift tolerated), window
+  focused, in **every** windowed state (live / manual / cycle / waiting (R8) /
+  idle (R22) / image-gone (R23)), windowed and `--fullscreen` (R16) alike.
+  `i` **toggles**: it shows the overlay when hidden and hides it when shown.
+  It is always effective (show or hide) and shows **no R30 feedback** — the
+  overlay is its own feedback.
+- **Content:** the **generation prompt** of the **currently displayed**
+  image file, extracted from the file's embedded metadata. **Sources (initial
+  set — revisitable as generation tools evolve):**
+
+  | Format | Where | The prompt is |
+  |--------|-------|---------------|
+  | PNG | `tEXt` / `zTXt` / `iTXt` chunks, key `parameters`, `prompt`, `Prompt`, or `Comment` (first match wins) | the text **before the first line that begins** (after leading whitespace) with `Steps:` / `CFG scale:` / `Sampler:` / `Seed:` / `Size:` — the stable-diffusion.cpp metadata convention (that line and everything after it is generator metadata, not displayed); with no such line, the whole value |
+  | JPEG / WebP | EXIF `UserComment` (CIPA ASCII or Unicode) | the comment text |
+
+  The read is **bounded to the first 8 MiB** of the file (embedded metadata
+  sits at the file head; the bound keeps large files from stalling the main
+  thread). A prompt not found within the bound counts as **not found**.
+- **`no information`:** shown instead of a prompt whenever none is found —
+  the displayed file carries no embedded prompt, the file cannot be read, or
+  **no image is displayed at all** (waiting (R8), idle (R22), image-gone
+  (R23)).
+- **Display:** word-wrapped at **80 % of the canvas width** (the same 10 %
+  side margins as R30), pale-yellow text at **1.5×** the normal font size on
+  the R30 gray shade (`#ffffb5` on `rgba(70,70,70,.65)`), in the
+  **bottom-center column** with its bottom edge **22 % up from the canvas
+  bottom** — above the R30 feedback zone (bottom edge 10 %), so a 1 s R30
+  feedback can appear below the info overlay without overlap and expire as
+  usual while the info overlay stays. The prompt's own line breaks are
+  preserved. Content taller than **50 % of the canvas height** is **elided**:
+  the text is truncated to the lines that fit, the last visible line ending
+  in `…`.
+- **Persistence & updates:** the overlay has **no timer** — it stays on
+  screen until `i` is pressed again. Every **display change** — a movement
+  key, `p`, `n`, a cycle advance (R27), a live arrival (R1/R3), an in-place
+  update (R4): any new displayed image version (§5.4) — **re-extracts** the
+  prompt from the newly displayed file and **updates the text in place**
+  (to another prompt, or to `no information`). Position, margins, and wrap
+  are computed at **show time** and at each **full-screen toggle** (new
+  canvas dimensions); a windowed-mode window resize is not tracked (GTK4 has
+  no resize signal — the same constraint as R30).
+- **Exclusivity with the help overlay (R32):** the two **never coexist**, and
+  **no state is remembered**: `i` with the help displayed dismisses the help
+  (the R32 dismiss-then-dispatch rule — `i` is a bound key) and then shows
+  the info overlay; `h`/`?` with the info overlay displayed dismiss the info
+  overlay and then show the help; dismissing the help later does **not**
+  re-show the info overlay (`i` again does).
+- **Cosmetic invariant:** no effect on the cycle clock or deadlines (R28),
+  selection (R3/R5), decode (R7), or window size (R24) — in cycle mode the
+  timer **keeps ticking under the overlay** and each advance updates its
+  text. `f`/`Esc`/canvas double-click **do not dismiss** the overlay — a
+  full-screen toggle keeps it, repositioned from the new canvas dimensions;
+  `q`/shutdown hides it. Nothing is shown at startup; `--print` (R12)
+  unaffected (no window).
+- **Prompt copy (`Ctrl+C`, R34, rev 1.8 amendment 5):** with the window
+  focused, `Ctrl+C` (Shift tolerated: `Ctrl+Shift+C` alike) copies **the
+  same text this overlay would display** — the displayed file's prompt, or
+  nothing — to the **system clipboard**: an effective copy shows the R30
+  overlay `prompt copied` (1 s); when there is nothing to copy (no displayed
+  image, or the file carries no prompt) there is **no clipboard write and no
+  overlay**. The overlay itself is **left in place** (the copy neither
+  toggles nor dismisses it); with the keyboard help (R32) displayed, the
+  help is dismissed first (the R32 dismiss-then-dispatch rule). It is a
+  **hidden feature** — not in the §5.9 help list. Purely cosmetic beyond the
+  clipboard write (the cosmetic invariant above). The terminal `Ctrl+C`
+  (SIGINT) and `SIGTERM` still quit (R18).
+- Headless-testable: the extracted prompt (or `no information`) for a file is
+  a **pure function of the file's bytes** — the extraction algorithm
+  (§12.11) is unit-testable with fixture images, no display required (case
+  8m); the copy seam (R34) — which text `Ctrl+C` hands to the clipboard,
+  or none — is likewise a pure function of the pre-press state (case 8n);
+  the overlay surface (toggle, update-on-swap, exclusivity, position) is
+  manual case 42, and the copy's on-screen surface (the `prompt copied`
+  overlay, the clipboard contents) is manual case 43.
 
 ## 6. Directory watching
 
@@ -1026,6 +1118,22 @@ Headless cases (runnable in a plain shell, no display needed — `tests/test_riv
    `space` while cycling stops the cycle and pins exactly as `p` (overlay
    `pause`); a no-op dispatch (idle state) shows nothing;
    the overlay text is the dispatched action's (R30).
+8m. **Prompt extraction (R33, rev 1.8, unit — no display)** → `extract_prompt`
+   is a pure function of the file's bytes: fixture PNGs with a `parameters`
+   chunk (single-line prompt; multi-line prompt with the `Steps:` metadata
+   line split off; `zTXt` compressed variant; key not in the set → ignored),
+   a JPEG / WebP EXIF `UserComment`, a file with no prompt text, an unknown
+   format, and a prompt beyond the 8 MiB read bound (→ not found) — each
+   asserts the extracted text or "not found" (the waiting / idle /
+   image-gone states likewise yield `no information` — no displayed file).
+8n. **Prompt copy seam (R34, rev 1.8 amendment 5, unit — no display)** → the
+   text `Ctrl+C` hands to the clipboard is a pure function of the pre-press
+   state: a displayed image with an embedded prompt → **exactly that prompt**
+   (the R33/§12.11 extraction — the same string the overlay shows, multi-line
+   prompts included); a displayed image without a prompt → **nothing** (no
+   clipboard write); no displayed image (waiting / idle / image-gone) →
+   nothing. The R30 feedback decision follows the effective-only rule: an
+   effective copy → `prompt copied`; a no-op copy → no overlay.
 
 GUI cases (require a graphical session — run inside COSMIC; this workspace's shell has no X
 authority, so these are manual/semi-automated):
@@ -1056,8 +1164,10 @@ authority, so these are manual/semi-automated):
     PNG → monitoring re-establishes and the new image appears (R14).
 21. **GIF** → a multi-frame GIF shows its first frame, stably.
 22. **SIGINT/SIGTERM** → clean exit, code 0, no traceback.
-23. **Keyboard shortcuts (R18)** → with the window focused: `q` quits (rc 0); `Ctrl+C`
-    quits cleanly (rc 0, no traceback); `f` toggles full screen both ways (header bar
+23. **Keyboard shortcuts (R18)** → with the window focused: `q` quits (rc 0); a `Ctrl+C`
+    **keypress with the window focused** copies the prompt (R34 — it is *not* a quit;
+    cases 8n/43); a `Ctrl+C` **in the terminal** (SIGINT) quits cleanly (rc 0, no
+    traceback); `f` toggles full screen both ways (header bar
     hidden in full screen, back on exit); `Esc` leaves full screen and does nothing in
     windowed mode; `Ctrl+q` / `Ctrl+f` are **not** shortcuts (leave the keys unhandled).
 24. **Canvas double-click (R19)** → a left double-click on the image *and* on the black
@@ -1209,7 +1319,7 @@ authority, so these are manual/semi-automated):
    the slides); `riview out/x.tga` (extension not in the default set) → exit 2
    (the default-set gate, §4.2 — `--extensions` does not lift it).
 41. **Keyboard help (R32, rev 1.7 amendment 4)** → live directory with 3 settled
-   images: `h` → the centered 12-line list (`Keys` header + 11 key lines, the exact
+   images: `h` → the centered 13-line list (`Keys` header + 12 key lines, the exact
    §5.9 text) appears on the canvas over the current image; header/status unchanged.
    `h` again → closes (no re-show). An unbound key (`a`) → closes, display
    unchanged. `n` with the help displayed → closes **and** switches to the newest
@@ -1217,8 +1327,43 @@ authority, so these are manual/semi-automated):
    coexist). Cycle mode: the timer keeps ticking under the overlay — the slide may
    change while the help is displayed — and `space` with the help displayed →
    closes and stops the cycle, pinning the *current* slide (R30 `pause` overlay).
-   In the idle state (R22) `?` shows the same list. Nothing is shown at startup
-   (including with `--cycle`); `--print` unaffected.
+   In the idle state (R22) `?` shows the same list. With the prompt
+   information overlay (R33) displayed, `h` → the info overlay is dismissed
+   and the list appears; dismissing the help does **not** re-show the info
+   overlay (no state remembered); `i` again re-shows it. Nothing is shown at
+   startup (including with `--cycle`); `--print` unaffected.
+42. **Prompt information overlay (R33, rev 1.8)** → a directory with settled
+   `rigen` images (embedded `parameters` chunk) and one image without
+   metadata: `i` → the displayed image's prompt appears bottom-center, above
+   the R30 feedback zone, word-wrapped at 80 % of the canvas width, and stays
+   on screen (no timer); `i` again → it disappears. Step to the
+   metadata-free image (`Left`/`Right`) → the overlay's text switches to
+   `no information` (still displayed); step back → its prompt returns.
+   Cycle mode with the overlay displayed: every advance updates the text to
+   the new slide's prompt (the timer ticks underneath); `c` itself shows the
+   R30 `cycle on: {N}s` **below** the overlay, expiring after 1 s while the
+   overlay stays. Waiting state (empty directory), idle (R22), and
+   image-gone: `i` → `no information`. `h` with the overlay displayed → the
+   overlay is dismissed and the help list appears; dismissing the help does
+   **not** re-show it; `i` again re-shows it (and vice versa). `f` keeps the
+   overlay through the full-screen toggle, repositioned. `i` shows no R30
+   feedback. Nothing is shown at startup; `--print` unaffected.
+43. **Prompt copy (R34, rev 1.8 amendment 5)** → a directory with settled
+   `rigen` images (embedded `parameters` chunks) and one image without
+   metadata: `Ctrl+C` on a prompted image → the R30 overlay `prompt copied`
+   shows for 1 s and the prompt pastes into another app (verified with
+   `wl-paste` / `xclip -o`) **character-for-character** identical to what the
+   `i` overlay displays (multi-line prompts preserved). `Ctrl+Shift+C` →
+   identical. On the metadata-free image — and in the waiting / idle /
+   image-gone states — nothing happens: no overlay, the clipboard
+   **unchanged** (a sentinel paste before the press still reads the
+   sentinel). With the prompt information overlay (R33) displayed: it stays
+   in place and the copied text equals its text. With the keyboard help
+   (R32) displayed: the help is dismissed and, when a copy is performed,
+   `prompt copied` shows (the two never coexist). Cycle mode: the timer
+   keeps ticking; the copy takes the *current* slide's prompt. Windowed and
+   `--fullscreen` alike. `Ctrl+C` in the **terminal** (SIGINT) still quits
+   (case 22). `--print` unaffected.
 
 ---
 
@@ -1502,6 +1647,17 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
                                 CENTER, normal font size (≈1×, not 2.5×), same
                                 #ffffb5-on-gray family, `riview-help` CSS class;
                                 hidden by default; §5.9)
+        ├── Gtk.Label          (prompt info, R33: bottom-center column — halign
+                                CENTER, valign END + bottom margin = 22 % of
+                                the canvas height (re-computed at show time
+                                and on full-screen toggle); word-wrapped at
+                                80 % of the canvas width, elided beyond 50 %
+                                of the canvas height (`…` on the last visible
+                                line); 1.5 em pale-yellow text, #ffffb5, on
+                                the rgba(70,70,70,.65) shade, `riview-info`
+                                CSS class; hidden by default; no timer —
+                                stays until `i` again, text updated on every
+                                display change, §5.10)
         └── Gtk.Box (center)
             └── Gtk.Label      (waiting/idle state, wrapped, max 60 chars, class
                                 riview-waiting; never shown in --fullscreen:
@@ -1521,7 +1677,8 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
   so it stays legible under light themes.
 - **Full screen (R16):** the header bar is hidden at construction and the waiting label
   is never shown, so the window contains only the black canvas and the image —
-  except the transient feedback overlay (R30, next bullet).
+  except the canvas overlays (R30 feedback, R32 help, R33 prompt info —
+  below).
 - **Feedback overlay (R30, §5.8):** a `Gtk.Label` in the same `Gtk.Overlay`
   (bottom center: `halign=CENTER`, `valign=END`; the bottom margin = 10% of
   the **canvas** height is computed at **show time** from the canvas
@@ -1554,6 +1711,32 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
   (bound keys then execute as usual; their R30 feedback may show after the
   dismissal). Purely cosmetic — it touches no cycle, selection, decode, or
   sizing state; cycle slides continue underneath.
+- **Prompt info overlay (R33, §5.10):** a `Gtk.Label` in the same
+  `Gtk.Overlay`, bottom-center column (`halign=CENTER`, `valign=END`), the
+  same `#ffffb5`-on-`rgba(70,70,70,0.65)` family under the `riview-info` CSS
+  class (same USER-priority provider, R17 bullet) at `font-size: 1.5em`;
+  hidden by default. `show_info()` (from `i`) first dismisses the help (the
+  R32 dismiss-then-dispatch path — the two never coexist), runs
+  `extract_prompt` (§12.11) on the **currently displayed file** (the
+  snapshot's path; `no information` when no image is displayed — waiting /
+  idle / image-gone — or when the file carries no prompt), sets the text,
+  positions the label (bottom margin 22 % of the canvas height; wrap width
+  80 % of the canvas width; a line budget derived from the font's line
+  height elides content beyond 50 % of the canvas height, the last visible
+  line ending in `…` — both margins re-computed at show time from the canvas
+  container's allocated size, as R30's 10 % margin; no windowed resize is
+  tracked), and shows it. **Update on display change:** the display-swap
+  path (the `_on_load_ok` handler that installs a new snapshot, §12.5) calls
+  `info_update()` whenever the overlay is visible: re-run the extraction on
+  the new snapshot's file and set the text (position/visibility kept) — a
+  bounded (8 MiB) synchronous file read on the main thread, at most a few
+  milliseconds for expected file sizes. `h`/`?` hide an active info overlay
+  before showing the help (no restore); `i` with the help displayed is
+  handled by the R32 dismiss-then-dispatch path. `_set_fullscreen` **keeps**
+  the overlay and re-runs the positioning (new canvas dimensions) when
+  visible; `do_shutdown` hides it. No timer of its own (unlike R30's one-shot
+  hide). Purely cosmetic — it touches no cycle, selection, decode, or sizing
+  state; cycle slides continue underneath, updating the text.
 - **Window fit (R24):** the window is sized through two paths. **Early fit**
   (at construction, §5.6): if a candidate is already settled, the size is the
   `fit_window` result for that file's `probe_dimensions` header size (header
@@ -1630,7 +1813,42 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
   dispatch to nothing (dismiss-only, no re-show); unbound keys are ignored. The
   help is purely cosmetic (R28 clock, R3 selection, R7 decode, R24 sizing
   untouched — cycle slides continue underneath; a later press acts on the current
-  slide). Nothing shown at startup; `--print` unaffected. While in **cycle mode** (R27), every one of these keys
+  slide). Nothing shown at startup; `--print` unaffected.
+
+  **Prompt information (R33, rev 1.8):** `i` toggles the overlay via
+  `show_info()` / `hide_info()`. `show_info()` runs `extract_prompt` (§12.11)
+  on the **currently displayed file** (the snapshot's path; `no information`
+  when no image is displayed — waiting, idle, image-gone — or when none is
+  found), sets the label text, and shows it; with the help displayed, the
+  R32 dismiss-then-dispatch path closes the help first (the two never
+  coexist). The display-swap path (§12.5) re-runs the extraction on the new
+  file whenever the overlay is visible and updates the text in place
+  (update-on-swap, §5.10). `h`/`?` hide an active info overlay before
+  showing the help (no restore — no state is remembered). A full-screen
+  toggle keeps the overlay and re-runs its positioning from the new canvas
+  dimensions. `do_shutdown` hides it. `i` shows no R30 feedback.
+
+  **Prompt copy (R34, rev 1.8 amendment 5):** `Ctrl+C` is the key handler's
+  single exception to the bare-keys modifier gate (Ctrl — plus Shift — +
+  `c`, matched before the gate): it calls `copy_prompt()`, which runs
+  `extract_prompt` (§12.11) on the **currently displayed file** (the
+  snapshot's path); when a prompt is found it writes it to the standard
+  system clipboard — the C ABI call
+  `gdk_clipboard_set_text(gdk_display_get_clipboard(display), text, -1)`
+  (NUL-terminated UTF-8, multi-line prompts included), resolved from
+  `libgtk-4.so.1` with standard-library **ctypes** only — this system's
+  PyGObject typelib (GDK 4.14, reduced introspection) exposes the
+  `Gdk.Clipboard` object but **no text-clipboard helpers** (`Gtk.Clipboard`
+  is GTK 3; the GTK 4 text helpers — `Gtk.Text.copy_content`, `Gdk.Text` —
+  are absent from the typelib and the library's exports here) — and shows
+  the R30 overlay `prompt copied`; when there is no displayed image or no
+  prompt it does nothing (no clipboard write, no overlay). With the help
+  displayed, the R32 dismiss-then-dispatch path runs first (the help is
+  dismissed, then the copy — and its `prompt copied` overlay — proceeds).
+  The R33 info overlay is left in place. Purely cosmetic beyond the
+  clipboard write.
+
+  While in **cycle mode** (R27), every one of these keys
   first stops the cycle (`cycle_mode = False`, `next_advance_mono = None`,
   indicator cleared) and then applies the semantics above against the
   currently displayed slide (a settled candidate — the anchor is its own
@@ -1695,7 +1913,13 @@ Adw.ApplicationWindow  (icon: com.lemonade.riview if installed, else image-x-gen
 - **Ctrl+C / SIGTERM:** `GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, cb)` installs
   C-level handlers (replacing Python's `KeyboardInterrupt` path) that call
   `Gio.Application.quit()` → clean shutdown, exit 0 (§11 case 22). The callback returns
-  `False` (one-shot).
+  `False` (one-shot). **Closure calling convention (latent-defect fix, found while
+  verifying case 43):** this GLib/PyGObject invokes the `unix_signal_add` closure with
+  **no arguments** (user_data None — the C-doc "passed the signal number" convention
+  does not hold here), so the signature is `_on_signal(self, signum=None)` — both
+  conventions accepted. With a required `signum`, the first terminal `Ctrl+C` printed a
+  `TypeError` and the one-shot source was consumed, so only the second press (Python's
+  default SIGINT path) exited.
 
 ### 12.10 Target resolution, launch context, desktop install (rev 0.8; §4.6–§4.7, R20–R22)
 
@@ -1742,6 +1966,45 @@ is_gui_context(): DESKTOP_STARTUP_ID set  OR  /dev/tty not openable
   tolerated; a note on stderr when nothing was removed); exit 0 either way.
 - **Window icon (R20):** `set_icon_name("com.lemonade.riview")` when the icon file exists
   at the installed path, else `image-x-generic`.
+
+### 12.11 Prompt extraction (R33, rev 1.8)
+
+```
+extract_prompt(path, bound=8 MiB) -> str | None:
+    data = read(path, first `bound` bytes)         # OSError -> None
+    if PNG (magic \x89PNG):
+        walk the chunks after the 8-byte signature
+        (4-byte BE length + 4cc + body + CRC); for a tEXt / zTXt / iTXt
+        chunk with key in {parameters, prompt, Prompt, Comment} (zTXt:
+        zlib-decompress the body after key + method byte; iTXt: skip the
+        lang tag and the UTF-8 flag):
+            return split_parameters(decode-utf8-replace(body))
+        return None                                 # first match wins;
+                                                    # no such key -> None
+    if JPEG (\xff\xd8):    payload = the APP1 "Exif\0\0" segment
+    if WebP (RIFF/WEBP):   payload = the "EXIF" chunk
+        return tiff_usercomment(payload)            # tag 0x9286, CIPA ASCII
+                                                    # or Unicode, padding
+                                                    # stripped; None if absent
+    return None                                     # unknown format
+
+split_parameters(value) -> str:
+    # stable-diffusion.cpp / SD.Next convention: the prompt first, then
+    # metadata line(s) beginning with one of the keys below
+    for i, line in enumerate(value.split("\n")):
+        if line.strip() starts with one of
+           ("Steps:", "CFG scale:", "Sampler:", "Seed:", "Size:"):
+            return value[:i].rstrip()
+    return value.rstrip("\n")
+```
+
+The `prompt_extract` prototype (a standalone script next to `riview`, not
+imported by it) implements this algorithm; it was validated against
+`lemonade` (stable-diffusion.cpp service) images, where the prompt arrives in
+a `tEXt` chunk with key `parameters`, the metadata line following the
+prompt. The source set in §5.10 is the **change point** as other generators
+are used (e.g. ComfyUI's JSON `prompt` chunk, A1111 variants) — the
+`split_parameters` split keys and the chunk/key set are the two knobs.
 
 ## 13. Environment (verified on this machine, 2026-02)
 
