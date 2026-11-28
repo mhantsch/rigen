@@ -79,7 +79,8 @@ printf 'a {red|blue} sky\n' | ./vary | ./rigen -m SD-1.5 --count 2 --out ./out
 ## riview — Reloading Image Viewer
 
 `riview` is a small GTK 4 / libadwaita viewer that watches a directory (or a
-single image file) and displays the newest image in it, reloading the display
+single image file — in which case it watches the file's directory and starts
+pinned to that file in manual mode) and displays the newest image in it, reloading the display
 as files change. It is meant to sit open while `rigen` (or anything else)
 writes into the watched directory. In directory mode you can step back through
 the settled images with `Left`/`Right`, jump to either end with `Home`/`End`, and
@@ -101,9 +102,10 @@ See `RIVIEW-SW-SPEC-AND-DESIGN.md` (specification §1–§11 and design §12–�
 # on the black canvas (idle state) instead of guessing a directory.
 cd out && ./riview
 
-# Watch one image file in place: only that file is ever shown, and it
-# reloads as it is overwritten (a newer *other* file in the same directory
-# never takes over).
+# File target: watch the containing directory, starting pinned to one image
+# file (manual mode) — it reloads as it is overwritten (a newer *other* file in
+# the same directory never takes over); Left/Right navigate the directory, n
+# goes live, c cycles starting at this file (rev 1.7.4).
 ./riview out/frame_012.png
 
 # Watch a specific directory, full screen (image only, no header bar).
@@ -185,12 +187,17 @@ shows a brief 1 s
 on-canvas overlay — pale-yellow text on a semi-transparent gray shade,
 bottom center, its bottom edge about 10% up from the canvas bottom; in
 windowed mode the header keeps its status alongside it (rev 1.7, window
-mode added in 1.7.1). If the
+mode added in 1.7.1). `h` (or `?`) shows a short keyboard help overlay,
+centered on the canvas at a normal font size; it stays on screen until the
+next keypress, which dismisses it and — if the key is bound — executes it
+as usual, so the help overlay and the feedback overlay never appear at the
+same time (1.7.5). If the
 pinned file is deleted or renamed away the canvas goes black with a message;
 `Left`/`Right` keep scanning from where the image was (the pin remembers its
 mtime), and the display restores itself if the file reappears. `r` re-fits the
-window to the currently displayed image (any mode except `--fit off`). In
-single-file mode the movement keys have no effect.
+window to the currently displayed image (any mode except `--fit off`). A
+file target starts pinned to that file (manual mode) — the movement keys
+navigate the containing directory's images from there (1.7.4).
 
 ### Exit codes
 

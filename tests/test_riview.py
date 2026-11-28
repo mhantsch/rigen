@@ -330,7 +330,7 @@ class TestCliValidation(unittest.TestCase):
     def test_version(self):
         r = run_riview("--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("riview 1.7.3", r.stdout)
+        self.assertIn("riview 1.7.5", r.stdout)
 
     def test_missing_dir_exit3(self):
         r = run_riview("--print", self.dir + "/no-such-dir")
@@ -711,6 +711,7 @@ class TestInputShortcuts(unittest.TestCase):
         w.calls = []
         w.close = lambda: w.calls.append("close")
         w._set_fullscreen = lambda on: w.calls.append(f"fs:{on}")
+        w._help_visible = False  # R32 (rev 1.7.5): help dismiss path
         return w
 
     def _key(self, w, keyval, *mods):
@@ -877,6 +878,7 @@ def make_fake_window(Window, **kw):
     w.observer = {}
     w.snapshot = None
     w.pinned_path = None
+    w._pin_first_display = False  # file target (rev 1.7.4, R21)
     w.image_gone = False
     w.current_gen = 0
     w.window_s = WINDOW
@@ -912,6 +914,9 @@ def make_fake_window(Window, **kw):
     # Key-press feedback (rev 1.7, R30): label + pending timer:
     w._feedback_label = _FakeFeedbackLabel()
     w._feedback_id = None
+    # Keyboard help (rev 1.7.5, R32): label + visibility flag:
+    w._help_label = _FakeFeedbackLabel()
+    w._help_visible = False
     w.header = _Rec()
     for k, v in kw.items():
         setattr(w, k, v)
@@ -1312,17 +1317,25 @@ class TestManualNavKeys(unittest.TestCase):
         self.assertEqual(w.decoder.requests,
                          [(1, self._path("a.png"))])
 
-    def test_single_file_mode_noop(self):
-        # case 30: navigation keys have no effect in single-file mode
+    def test_file_target_nav_works(self):
+        # rev 1.7.4 (R21, case 30): a file target starts pinned to the
+        # target file (manual mode); the navigation keys work as in
+        # directory mode on the containing directory's candidates.
         self._settle([("a.png", 300), ("b.png", 200)])
-        w = self._win(mode="file", snapshot=snap(self._path("b.png"), 0))
+        b = self._path("b.png")
+        w = self._win(mode="file", only_path=b, pinned_path=b,
+                      snapshot=snap(b, 0))
         Gdk = self.Gdk
         self.assertTrue(self._key(w, Gdk.KEY_Left))
+        self.assertEqual(w.pinned_path, self._path("a.png"))
         self.assertTrue(self._key(w, Gdk.KEY_Right))
+        self.assertEqual(w.pinned_path, self._path("b.png"))
+        self.assertEqual(
+            w.decoder.requests,
+            [(1, self._path("a.png")), (2, self._path("b.png"))])
         self.assertTrue(self._key(w, Gdk.KEY_n))
-        self.assertEqual(w.decoder.requests, [])
-        self.assertIsNone(w.pinned_path)
-        self.assertEqual(w.watcher.rescans, [])
+        self.assertIsNone(w.pinned_path)  # n → live, newest
+        self.assertEqual(w.watcher.rescans, [0])
 
     def test_waiting_state_noop(self):
         w = self._win()  # empty directory, nothing displayed
@@ -1470,15 +1483,19 @@ class TestManualNavKeys(unittest.TestCase):
         self.assertEqual(w.decoder.requests, [])
         self.assertIsNone(w.pinned_path)
 
-    def test_home_end_single_file_noop(self):
-        # case 32: the jump keys have no effect in single-file mode
+    def test_home_end_file_target(self):
+        # rev 1.7.4 (R21, case 32): the jump keys work on a file target
+        # — they pin the containing directory's oldest / newest settled
+        # candidate.
         self._settle([("a.png", 300), ("b.png", 200)])
-        w = self._win(mode="file", snapshot=snap(self._path("b.png"), 0))
+        b = self._path("b.png")
+        w = self._win(mode="file", only_path=b, pinned_path=b,
+                      snapshot=snap(b, 0))
         Gdk = self.Gdk
         self.assertTrue(self._key(w, Gdk.KEY_Home))
+        self.assertEqual(w.pinned_path, self._path("a.png"))
         self.assertTrue(self._key(w, Gdk.KEY_End))
-        self.assertEqual(w.decoder.requests, [])
-        self.assertIsNone(w.pinned_path)
+        self.assertEqual(w.pinned_path, self._path("b.png"))
 
     def test_end_after_image_gone_pins_newest(self):
         # End recovers the image-gone state but stays manual (pinned to the
@@ -1569,12 +1586,15 @@ class TestCycleModeGui(unittest.TestCase):
         self.assertTrue(self._key(w, self.Gdk.KEY_c))
         self.assertTrue(w.cycle_mode)
 
-    def test_c_noop_in_single_file_mode(self):
+    def test_c_starts_cycle_in_file_target(self):
+        # rev 1.7.4 (R21): c works on a file target — the cycle starts
+        # (its first slide is the target file; see TestFileTarget).
         p = self._path("a.png")
         write(p)
         w = self._win(mode="file", only_path=p)
         self.assertTrue(self._key(w, self.Gdk.KEY_c))
-        self.assertFalse(w.cycle_mode)
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(w.cycle_s, 9)
 
     # -- R31 (rev 1.7.2): space toggles cycle <-> pause -------------------------
     def test_space_starts_cycle_like_c(self):
@@ -1608,13 +1628,15 @@ class TestCycleModeGui(unittest.TestCase):
         self.assertTrue(w.cycle_mode)
         self.assertEqual(w._feedback_label.text, "cycle on: 9s")
 
-    def test_space_noop_in_single_file_mode(self):
+    def test_space_starts_cycle_in_file_target(self):
+        # rev 1.7.4 (R21): space works on a file target (R31 dispatch:
+        # not cycling → the c path).
         p = self._path("a.png")
         write(p)
         w = self._win(mode="file", only_path=p)
         self.assertTrue(self._key(w, self.Gdk.KEY_space))
-        self.assertFalse(w.cycle_mode)
-        self.assertFalse(w._feedback_label.visible)  # no-op -> no overlay
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(w._feedback_label.text, "cycle on: 9s")  # R30
 
     def test_left_exits_cycle_and_steps_older(self):
         self._settle([("a.png", 300), ("b.png", 200), ("c.png", 100)])
@@ -1947,13 +1969,14 @@ class TestFeedbackOverlay(unittest.TestCase):
         self._key(w, self.Gdk.KEY_p)
         self.assertEqual(self._texts(w), [])
 
-    def test_c_single_file_no_overlay(self):
+    def test_c_file_target_overlay(self):
+        # rev 1.7.4 (R21): c is effective on a file target → overlay.
         p = self._path("a.png")
         write(p)
         w = self._fs(self._win(mode="file", only_path=p))
         self._key(w, self.Gdk.KEY_c)
-        self.assertFalse(w.cycle_mode)
-        self.assertEqual(self._texts(w), [])
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(self._texts(w), ["cycle on: 9s"])
 
     def test_no_overlay_at_startup(self):
         """A full-screen launch shows nothing until the first keypress."""
@@ -2645,7 +2668,7 @@ class TestFitWindowGui(unittest.TestCase):
         w = self._init_win(dir_abs=self.d, fit_mode="off")
         self.assertEqual(w._init_size(), (1536, 864))
 
-    def test_init_size_single_file_mode(self):
+    def test_init_size_file_target(self):
         p = os.path.join(self.d, "a.png")
         write(p, self._png_bytes(800, 600), mtime=time.time() - 100)
         w = self._init_win(mode="file", only_path=p, dir_abs=self.d)
@@ -2659,6 +2682,320 @@ class TestFitWindowGui(unittest.TestCase):
         w = self._init_win(dir_abs=self.d)
         w.header = self._Hdr(0)  # unallocated
         self.assertEqual(w._init_size(), (1089, 864))
+
+
+class TestFileTarget(unittest.TestCase):
+    """rev 1.7 amendment 4 (riview 1.7.4): file target (R21 rewrite).
+
+    A file target watches its containing directory in full and starts in
+    manual mode, pinned to the target file, with an immediate first
+    display; navigation works as in directory mode. Spec §5.1, §5.5, §11
+    cases 27, 30, 40.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for var in ("DISPLAY", "WAYLAND_DISPLAY"):
+            os.environ.pop(var, None)
+        try:
+            _D, _W, cls.Window, _A = riview._gui_classes()
+        except Exception as e:
+            raise unittest.SkipTest(f"GTK not importable headless: {e}")
+        import gi
+        gi.require_version("Gdk", "4.0")
+        from gi.repository import Gdk
+        cls.Gdk = Gdk
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="riview-file-target-")
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _win(self, **kw):
+        return make_fake_window(self.Window, dir_abs=self.d, **kw)
+
+    def _key(self, w, keyval, *mods):
+        state = 0
+        for m in mods:
+            state |= int(m)
+        return self.Window._on_key(w, None, keyval, 0, state)
+
+    def _path(self, name):
+        return os.path.join(self.d, name)
+
+    def _settle(self, names):
+        now = time.time()
+        for name, age_s in names:
+            write(self._path(name), mtime=now - age_s)
+
+    def _mns(self, name):
+        return os.stat(self._path(name)).st_mtime_ns
+
+    # -- R21: target file bypasses the extension filter -------------------
+    def test_target_file_bypasses_extension_filter(self):
+        t = self._path("t.bmp")
+        write(t)
+        q = self._path("a.png")
+        write(q)
+        out = riview.scan_candidates(self.d, {"png"}, target_file=t)
+        self.assertEqual({c[0] for c in out}, {t, q})
+
+    def test_target_file_deleted_not_a_candidate(self):
+        q = self._path("a.png")
+        write(q)
+        out = riview.scan_candidates(self.d, {"png"},
+                                     target_file=self._path("gone.png"))
+        self.assertEqual({c[0] for c in out}, {q})
+
+    # -- R21: immediate first display (no settle wait) ----------------------
+    def test_first_display_immediate_no_settle(self):
+        # The target file is NOT settled (fresh mtime) — the first
+        # display happens anyway (Q3, §5.5 file target).
+        t = self._path("t.png")
+        write(t)
+        w = self._win(mode="file", only_path=t, pinned_path=t,
+                      _pin_first_display=True)
+        w.on_rescan()
+        self.assertEqual(w.decoder.requests, [(w.current_gen, t)])
+        self.assertFalse(w._pin_first_display)
+        self.assertFalse(w.image_gone)
+
+    def test_first_display_absent_image_gone(self):
+        # The target file is gone at the first rescan: image-gone state
+        # (R23), not a settle wait (case 27).
+        w = self._win(mode="file", only_path=self._path("t.png"),
+                      pinned_path=self._path("t.png"),
+                      _pin_first_display=True)
+        w.on_rescan()
+        self.assertEqual(w.decoder.requests, [])
+        self.assertTrue(w.image_gone)
+
+    def test_first_display_flag_fires_once(self):
+        # _pin_first_display is one-shot: a later in-place update of the
+        # still-settling target is settle-gated (R4/R23) — no request.
+        t = self._path("t.png")
+        write(t)
+        w = self._win(mode="file", only_path=t, pinned_path=t,
+                      _pin_first_display=True)
+        w.on_rescan()
+        n = len(w.decoder.requests)
+        self.assertEqual(n, 1)
+        write(t, data=b"second version")  # new version, still settling
+        w.on_rescan()
+        self.assertEqual(len(w.decoder.requests), n)
+
+    # -- R21/R29: --cycle / c start the cycle AT the target file ----------
+    def test_cycle_first_slide_is_target_file(self):
+        # The target file is neither the oldest nor the newest settled
+        # candidate — the first slide is the target file (the oldest-
+        # start rule does not apply for a file target).
+        self._settle([("t.png", 200), ("a.png", 300), ("b.png", 100)])
+        t = self._path("t.png")
+        w = self._win(mode="file", only_path=t, pinned_path=None,
+                      _pin_first_display=True, cycle_mode=True, cycle_s=9,
+                      start_oldest=False)
+        w.on_rescan()
+        self.assertEqual(w.decoder.requests[0][1], t)
+
+    def test_cycle_first_slide_failed_target_falls_back(self):
+        # The target's version failed to decode at the first slide: fall
+        # back to the directory rule — here (start_oldest False) the
+        # newest settled candidate b.png, proving the bypass fired
+        # (the target t.png is the OLDEST settled candidate).
+        self._settle([("t.png", 300), ("a.png", 200), ("b.png", 100)])
+        t = self._path("t.png")
+        st = os.stat(t)
+        w = self._win(mode="file", only_path=t, pinned_path=None,
+                      cycle_mode=True, start_oldest=False,
+                      failed_versions={(t, st.st_mtime_ns, st.st_size)})
+        w.on_rescan()
+        self.assertEqual(w.decoder.requests[0][1], self._path("b.png"))
+
+    # -- R21: keys at the file-target start --------------------------------
+    def test_p_at_file_target_start_is_noop(self):
+        # p at the start (already pinned to the target) is a no-op — no
+        # R30 overlay (R26).
+        self._settle([("a.png", 300)])
+        t = self._path("a.png")
+        w = self._win(mode="file", only_path=t, pinned_path=t,
+                      snapshot=snap(t, self._mns("a.png")))
+        self._key(w, self.Gdk.KEY_p)
+        self.assertEqual(w.pinned_path, t)
+        self.assertEqual(w.decoder.requests, [])
+        self.assertFalse(w._feedback_label.visible)
+
+    def test_n_from_file_target_exits_to_live(self):
+        self._settle([("a.png", 300), ("b.png", 200)])
+        t = self._path("a.png")
+        w = self._win(mode="file", only_path=t, pinned_path=t,
+                      snapshot=snap(t, self._mns("a.png"),
+                                    size=os.stat(t).st_size))
+        self._key(w, self.Gdk.KEY_n)
+        self.assertIsNone(w.pinned_path)
+        self.assertEqual(w.watcher.rescans, [0])
+        w.on_rescan()  # the scheduled rescan selects the newest settled
+        self.assertEqual(w.decoder.requests[-1][1], self._path("b.png"))
+
+    # -- R21: deletion at runtime → image-gone (case 27) -------------------
+    def test_pinned_file_deleted_image_gone(self):
+        self._settle([("a.png", 300), ("t.png", 200)])
+        t = self._path("t.png")
+        w = self._win(mode="file", only_path=t, pinned_path=t,
+                      snapshot=snap(t, self._mns("t.png")))
+        os.remove(t)
+        cands = riview.scan_candidates(self.d, w.exts, t)
+        riview.update_observed(w.observer, cands, NOW_MONO, NOW_WALL)
+        w._rescan_pinned(cands, NOW_MONO, NOW_WALL)
+        self.assertTrue(w.image_gone)
+        self.assertEqual(w.pinned_path, t)
+
+
+class TestKeyboardHelp(unittest.TestCase):
+    """rev 1.7 amendment 5 (riview 1.7.5): keyboard help overlay (R32).
+
+    h / ? show the centered help overlay; it stays on screen until the
+    next keypress, which dismisses it (and executes a bound key). The
+    two overlays never coexist. Spec §5.9, case 41.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for var in ("DISPLAY", "WAYLAND_DISPLAY"):
+            os.environ.pop(var, None)
+        try:
+            _D, _W, cls.Window, _A = riview._gui_classes()
+        except Exception as e:
+            raise unittest.SkipTest(f"GTK not importable headless: {e}")
+        import gi
+        gi.require_version("Gdk", "4.0")
+        from gi.repository import Gdk
+        cls.Gdk = Gdk
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="riview-help-")
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _win(self, **kw):
+        return make_fake_window(self.Window, dir_abs=self.d, **kw)
+
+    def _key(self, w, keyval, *mods):
+        state = 0
+        for m in mods:
+            state |= int(m)
+        return self.Window._on_key(w, None, keyval, 0, state)
+
+    def _path(self, name):
+        return os.path.join(self.d, name)
+
+    def _settle(self, names):
+        now = time.time()
+        for name, age_s in names:
+            write(self._path(name), mtime=now - age_s)
+
+    def _mns(self, name):
+        return os.stat(self._path(name)).st_mtime_ns
+
+    def _texts(self, w):
+        return [a[1][0] for a in w._feedback_label.calls
+                if a[0] == "set_text"]
+
+    def test_help_text_matches_spec(self):
+        # Normative strings (spec §5.9): 12 lines, exact frame.
+        lines = riview.HELP_TEXT.split("\n")
+        self.assertEqual(len(lines), 12)
+        self.assertEqual(lines[0], "Keys")
+        self.assertEqual(
+            lines[1], "  Left / Right     display older / newer image")
+        self.assertEqual(lines[-1], "  q                quit")
+
+    def test_h_shows_help_no_feedback(self):
+        w = self._win()
+        self._key(w, self.Gdk.KEY_h)
+        self.assertTrue(w._help_visible)
+        self.assertTrue(w._help_label.visible)
+        self.assertEqual(w._help_label.text, riview.HELP_TEXT)
+        self.assertFalse(w._feedback_label.visible)
+        self.assertEqual(self._texts(w), [])
+
+    def test_question_shows_help(self):
+        w = self._win()
+        self._key(w, self.Gdk.KEY_question)
+        self.assertTrue(w._help_visible)
+
+    def test_shifted_h_shows_help(self):
+        w = self._win()
+        self._key(w, self.Gdk.KEY_H, self.Gdk.ModifierType.SHIFT_MASK)
+        self.assertTrue(w._help_visible)
+
+    def test_h_dismisses_when_visible_no_reshow(self):
+        w = self._win()
+        self._key(w, self.Gdk.KEY_h)
+        self._key(w, self.Gdk.KEY_h)
+        self.assertFalse(w._help_visible)  # 2nd press dismisses
+        self._key(w, self.Gdk.KEY_h)
+        self.assertTrue(w._help_visible)   # 3rd press shows again
+
+    def test_h_works_in_idle_state(self):
+        # Every windowed state, including idle (R22).
+        w = self._win(mode="none")
+        self._key(w, self.Gdk.KEY_h)
+        self.assertTrue(w._help_visible)
+
+    def test_unbound_key_dismisses_only(self):
+        self._settle([("a.png", 300)])
+        w = self._win(snapshot=snap(self._path("a.png"), self._mns("a.png")))
+        self._key(w, self.Gdk.KEY_h)
+        self._key(w, self.Gdk.KEY_a)  # unbound
+        self.assertFalse(w._help_visible)
+        self.assertEqual(w.decoder.requests, [])
+
+    def test_bound_key_dismisses_and_executes(self):
+        # Dismiss-then-dispatch: n executes and its R30 feedback shows
+        # (the overlays never coexist — help was gone first).
+        self._settle([("a.png", 300), ("b.png", 200)])
+        a = self._path("a.png")
+        w = self._win(pinned_path=a, snapshot=snap(a, self._mns("a.png")))
+        self._key(w, self.Gdk.KEY_h)
+        self._key(w, self.Gdk.KEY_n)
+        self.assertFalse(w._help_visible)
+        self.assertIsNone(w.pinned_path)
+        self.assertEqual(self._texts(w), ["newest live image"])
+        self.assertTrue(w._feedback_label.visible)
+
+    def test_bound_noop_key_dismisses_no_overlay(self):
+        # A bound no-op (c while cycling) still dismisses; no R30 overlay.
+        w = self._win(cycle_mode=True, cycle_s=9)
+        self._key(w, self.Gdk.KEY_h)
+        self._key(w, self.Gdk.KEY_c)
+        self.assertFalse(w._help_visible)
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(self._texts(w), [])
+
+    def test_h_dismisses_active_feedback(self):
+        # h hides an active R30 feedback first — and drops its timer.
+        self._settle([("a.png", 300)])
+        w = self._win(snapshot=snap(self._path("a.png"), self._mns("a.png")))
+        self._key(w, self.Gdk.KEY_c)
+        self.assertTrue(w._feedback_label.visible)
+        self._key(w, self.Gdk.KEY_h)
+        self.assertFalse(w._feedback_label.visible)
+        self.assertIsNone(w._feedback_id)
+        self.assertTrue(w._help_label.visible)
+
+    def test_cycle_continues_under_help(self):
+        # Purely cosmetic: the cycle's state and tick are untouched by
+        # the help overlay (Q5).
+        self._settle([("a.png", 300)])
+        w = self._win(cycle_mode=True, cycle_s=9)
+        w._cycle_tick_id = "tick"  # armed (fake)
+        self._key(w, self.Gdk.KEY_h)
+        self.assertTrue(w.cycle_mode)
+        self.assertEqual(w._cycle_tick_id, "tick")
+        self._key(w, self.Gdk.KEY_a)  # unbound key dismisses too
+        self.assertFalse(w._help_visible)
 
 
 if __name__ == "__main__":
